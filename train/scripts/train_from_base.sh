@@ -47,6 +47,10 @@ PORT="${ARNOLD_WORKER_0_PORT%%,*}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # Worldmodel python package lives under Worldmodel/infinity/.
 # Add the directory containing the `infinity/` package to PYTHONPATH.
+<<<<<<< Updated upstream
+=======
+# Use the runtime copy of the InfinityStar package (contains `infinity/dataset`).
+>>>>>>> Stashed changes
 export PYTHONPATH="${REPO_ROOT}/../Worldmodel/runtime${PYTHONPATH:+:${PYTHONPATH}}"
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"

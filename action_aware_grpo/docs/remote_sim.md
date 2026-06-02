@@ -19,7 +19,7 @@ python runtime/client.py \
   --mode service \
   --host 0.0.0.0 \
   --port 8765 \
-  --task_json_root /path/to/UAV-Flow-Eval/test_jsons
+  --task_json_root /path/to/uavflow_tasks/select_from_train_jsons
 ```
 
 ## Reverse Port Forwarding
@@ -62,7 +62,7 @@ export ACTIONHEAD_RUN_CONFIG=/path/to/actionhead/run_config.json
 UAVFLOW_STAGEA_ROLLOUT_BACKEND=remote_sim
 UAVFLOW_SIMULATOR_BASE_URL=http://127.0.0.1:18765
 export UAVFLOW_SIMULATOR_TIMEOUT_S=120
-UAVFLOW_TASK_JSON_ROOT=/path/to/UAV-Flow-Eval/test_jsons
+UAVFLOW_TASK_JSON_ROOT=/path/to/uavflow_tasks/select_from_train_jsons
 STAGEA_NPROC=1
 
 export RUN_ID=rl_rollout_smoke_$(date +%Y%m%d_%H%M%S)

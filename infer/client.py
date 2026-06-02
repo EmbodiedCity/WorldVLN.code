@@ -303,7 +303,7 @@ def _load_num_frames_step_from_config(config_json: str) -> Tuple[int, int]:
 
 def _load_instruction_and_initial_pose_from_task_json(task_json_path: str) -> Tuple[str, List[float]]:
     """
-    Read a UAV-Flow-Eval task json (e.g. test_jsons/*.json) and extract:
+    Read a rollout task json (e.g. select_from_train_jsons/*.json) and extract:
     - instruction (or instruction_unified)
     - initial_pos: [x,y,z,roll,yaw,pitch] in cm/deg
     """
@@ -1117,7 +1117,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", type=str, default="dataset", choices=["dataset", "unrealcv"], help="dataset: send frames from dataset_root; unrealcv: capture frames from gym_unrealcv using task json(s).")
     ap.add_argument("--dataset_root", type=str, default="", help="(mode=dataset) Dataset root containing route folders with images/ + meta.json (+ raw_logs.json optional).")
-    ap.add_argument("--task_json", type=str, default="", help="(mode=unrealcv) Single task json path, e.g. ./test_jsons/2025-03-30_11-49-14.json")
+    ap.add_argument("--task_json", type=str, default="", help="(mode=unrealcv) Single task json path, e.g. ./select_from_train_jsons/2025-03-30_11-49-14.json")
     ap.add_argument("--json_folder", type=str, default="", help="(mode=unrealcv) Folder containing multiple task json files.")
     ap.add_argument("--json_order", type=str, default="asc", choices=["asc", "desc"], help="(mode=unrealcv) Order for iterating --json_folder by filename.")
     ap.add_argument("--json_start", type=str, default="", help="(mode=unrealcv) Optional lower bound filename for --json_folder (e.g. 2025-03-30_12-02-10 or 2025-03-30_12-02-10.json).")

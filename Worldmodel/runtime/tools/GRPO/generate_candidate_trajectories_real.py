@@ -347,7 +347,7 @@ def main():
     default_package_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
     default_repo_root = os.path.abspath(os.path.join(default_package_root, ".."))
     default_actionhead_repo_root = os.path.join(default_repo_root, "Worldmodel", "action_decoder", "actionhead_runtime")
-    default_task_json_root = os.path.join(default_package_root, "data", "UAV-Flow-Eval", "test_jsons")
+    default_task_json_root = os.path.join(default_package_root, "data", "uavflow_tasks", "select_from_train_jsons")
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidates_jsonl", type=str, required=True)
@@ -419,7 +419,7 @@ def main():
         "--uavflow_task_json_root",
         type=str,
         default=str(os.environ.get("UAVFLOW_TASK_JSON_ROOT", default_task_json_root)),
-        help="Directory containing UAV-Flow-Eval task json files named <task_id>.json.",
+        help="Directory containing rollout task json files named <task_id>.json.",
     )
     args = ap.parse_args()
 

@@ -9,6 +9,7 @@ import random
 import sys
 import time
 import traceback
+import importlib.util
 from collections import deque
 from contextlib import nullcontext
 from functools import partial
@@ -18,6 +19,31 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['XFORMERS_FORCE_DISABLE_TRITON'] = '1'
 # os.environ["TORCH_LOGS"] = "+dynamo"
 # os.environ["TORCHDYNAMO_VERBOSE"] = '1'
+
+def _ensure_infinity_runtime_on_path() -> None:
+    """
+    Ensure we import the *runtime* InfinityStar package layout.
+
+    In this repo, `infinity/dataset` is vendored under `Worldmodel/runtime/`.
+    If PYTHONPATH points to `Worldmodel/` (non-runtime) only, `infinity.dataset`
+    may not exist and will raise ModuleNotFoundError.
+    """
+    try:
+        if importlib.util.find_spec("infinity.dataset") is not None:
+            return
+    except Exception:
+        # If importlib cannot resolve for some reason, fall back to adding runtime path.
+        pass
+
+    # opensource/train/train.py -> opensource/train -> opensource
+    open_root = osp.abspath(osp.join(osp.dirname(__file__), ".."))
+    runtime_root = osp.join(open_root, "Worldmodel", "runtime")
+    if osp.isdir(runtime_root) and runtime_root not in sys.path:
+        # Prepend to override any earlier `Worldmodel/` entry.
+        sys.path.insert(0, runtime_root)
+
+
+_ensure_infinity_runtime_on_path()
 
 import numpy as np
 import torch

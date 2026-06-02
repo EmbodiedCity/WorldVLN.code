@@ -17,6 +17,10 @@ env/
 **/data/
 **/dataset/
 
+# Allow vendored dataset *code* (not training data).
+!Worldmodel/runtime/infinity/dataset/
+!Worldmodel/runtime/infinity/dataset/**
+
 # Common ML artifacts
 *.pth
 *.pt
@@ -29,6 +33,11 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# local caches
+.cache/
+__pycache__/
+*.pyc
 
 # local caches
 .cache/

@@ -318,7 +318,7 @@ def _load_num_frames_step_from_config(config_json: str) -> Tuple[int, int]:
 
 def _load_instruction_and_initial_pose_from_task_json(task_json_path: str) -> Tuple[str, List[float]]:
     """
-    Read a UAV-Flow-Eval task json (e.g. test_jsons/*.json) and extract:
+    Read a rollout task json (e.g. select_from_train_jsons/*.json) and extract:
     - instruction (or instruction_unified)
     - initial_pos: [x,y,z,roll,yaw,pitch] in cm/deg
     """
@@ -1444,7 +1444,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", type=str, default="dataset", choices=["dataset", "unrealcv", "service"], help="dataset: send frames from dataset_root; unrealcv: capture frames from gym_unrealcv using task json(s); service: expose /reset and /step_actions for local StageA remote_sim.")
     ap.add_argument("--dataset_root", type=str, default="", help="(mode=dataset) Dataset root containing route folders with images/ + meta.json (+ raw_logs.json optional).")
-    ap.add_argument("--task_json", type=str, default="", help="(mode=unrealcv) Single task json path, e.g. ./test_jsons/2025-03-30_11-49-14.json")
+    ap.add_argument("--task_json", type=str, default="", help="(mode=unrealcv) Single task json path, e.g. ./select_from_train_jsons/2025-03-30_11-49-14.json")
     ap.add_argument("--json_folder", type=str, default="", help="(mode=unrealcv) Folder containing multiple task json files.")
     ap.add_argument("--json_order", type=str, default="asc", choices=["asc", "desc"], help="(mode=unrealcv) Order for iterating --json_folder by filename.")
     ap.add_argument("--json_start", type=str, default="", help="(mode=unrealcv) Optional lower bound filename for --json_folder (e.g. 2025-03-30_12-02-10 or 2025-03-30_12-02-10.json).")
@@ -1457,7 +1457,7 @@ def main():
     ap.add_argument("--ue_port", type=int, default=0, help="(mode=unrealcv) If >0, set UnrealCV socket base port in unrealcv.ini before launching UE. Useful to run multiple UE instances in parallel (e.g. 9393/9394).")
     ap.add_argument("--host", type=str, default="0.0.0.0", help="(mode=service) HTTP listen host.")
     ap.add_argument("--port", type=int, default=8765, help="(mode=service) HTTP listen port.")
-    ap.add_argument("--task_json_root", type=str, default="", help="(mode=service) Optional local UAV-Flow-Eval test_jsons directory for resolving task_id -> task json on the simulator machine.")
+    ap.add_argument("--task_json_root", type=str, default="", help="(mode=service) Optional local select_from_train_jsons directory for resolving task_id -> task json on the simulator machine.")
     ap.add_argument("--yaw_offset_deg", type=float, default=-180.0, help="(mode=unrealcv) Yaw offset applied when calling UnrealCV set_rotation. batch_run_act_all.py uses -180.")
     ap.add_argument("--action_frame", type=str, default="body", choices=["world", "body"], help="How to interpret dx/dy when integrating poses/logs: world=direct add; body=dx,dy in body forward/right rotated by yaw.")
     ap.add_argument("--body_apply_order", type=str, default="yaw_first", choices=["yaw_first", "trans_first", "midpoint"], help="Only for --action_frame=body. yaw_first: yaw+=dyaw then translate; trans_first: translate with old yaw then yaw+=dyaw; midpoint: translate with yaw+0.5*dyaw then yaw+=dyaw.")

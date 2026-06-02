@@ -227,7 +227,7 @@ NODE_RANK=0 \
 UAVFLOW_STAGEA_ROLLOUT_BACKEND=remote_sim \
 UAVFLOW_SIMULATOR_BASE_URL=http://127.0.0.1:18765 \
 UAVFLOW_SIMULATOR_TIMEOUT_S=120 \
-UAVFLOW_TASK_JSON_ROOT=/path/to/UAV-Flow-Eval/test_jsons \
+UAVFLOW_TASK_JSON_ROOT=/path/to/uavflow_tasks/select_from_train_jsons \
 bash action_aware_grpo/scripts/run_stagea_collect.sh RUN_ID=remote_sim_smoke TOP_N=1 K_CAND=1 STAGEA_NPROC=1 STAGEA_PROGRESS_EVERY_N=1
 ```
 
