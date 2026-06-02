@@ -62,7 +62,7 @@ From the repository root:
 ```bash
 export PYTHON_BIN=$(which python)
 export INFINITY_CKPT=/path/to/infinity/global_step_xxx.pth
-export STAGE2_LATENT2ACTION_CKPT=/path/to/stage2_latent2action_combined.pt
+export STAGE2_LATENT2ACTION_CKPT=/path/to/WorldVLN_action_decoder.pt
 
 bash infer/run_server.sh
 ```
