@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -62,6 +63,25 @@ def _to_relative_cmdeg(poses: List[List[float]]) -> List[List[float]]:
     return [[float(v) for v in row.tolist()] for row in out]
 
 
+def _gt_in_initial_frame(path: str, frame: str) -> List[List[float]]:
+    poses = _load_gt_poses(path)
+    if not poses:
+        raise ValueError(f"empty ground-truth trajectory: {path}")
+    module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "action_aware_grpo", "runtime", "pose_math.py"))
+    spec = importlib.util.spec_from_file_location("worldvln_reward_pose_math", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if frame == "world":
+        return module.world_poses_to_initial(poses)
+    if frame != "initial_body":
+        raise ValueError(f"unsupported gt_pose_frame={frame}; expected initial_body or world")
+    if not np.allclose(module.pose_to_matrix(poses[0]), np.eye(4), atol=1e-5):
+        raise ValueError("initial_body ground truth must start at the identity pose; set gt_pose_frame=world for absolute poses")
+    for pose in poses:
+        module.pose_to_matrix(pose)  # finite values and six-dimensional shape
+    return poses
+
+
 def _to_m_rad(arr_deg_cm: np.ndarray) -> np.ndarray:
     """
     Input/Output layout: [x, y, z, roll, yaw, pitch]
@@ -93,7 +113,9 @@ def _clip_mse(pred_poses: List[List[float]], gt_poses: List[List[float]]) -> Dic
     p = _to_m_rad(p_cmdeg)
     g = _to_m_rad(g_cmdeg)
     yaw_diff_rad = _yaw_wrap_rad(p[:, 4] - g[:, 4])
-    mse_all6_mrad = float(np.mean((p - g) ** 2))
+    all_diff = p - g
+    all_diff[:, 3:6] = _yaw_wrap_rad(all_diff[:, 3:6])
+    mse_all6_mrad = float(np.mean(all_diff ** 2))
     mse_xyz_m2 = float(np.mean((p[:, :3] - g[:, :3]) ** 2))
     mse_yaw_rad2 = float(np.mean(yaw_diff_rad**2))
     # keep cm/deg diagnostics for easy inspection
@@ -483,6 +505,8 @@ def main():
                     continue
                 with open(traj_path, "r", encoding="utf-8") as f:
                     tj = json.load(f)
+                if tj.get("sampling_backend") == "remote_sim" and tj.get("pose_source") != "simulator_observed":
+                    raise ValueError("remote_sim reward requires observed execution poses")
                 pred = tj.get("relative_poses", {}).get("poses", [])
                 try:
                     if "sample_logprob_total" not in tj:
@@ -496,7 +520,7 @@ def main():
                 gt_path = meta.get("gt_pose_json", "")
                 if not gt_path or not os.path.exists(gt_path):
                     continue
-                gt = _load_gt_poses(gt_path)
+                gt = _gt_in_initial_frame(gt_path, str(meta.get("gt_pose_frame", "initial_body")))
                 gt_use = gt[1:] if isinstance(gt, list) and len(gt) > 1 else []
                 act_pack = _reward_act_with_clip_decay(
                     pred_poses=pred,
@@ -546,8 +570,8 @@ def main():
                 meta["grpo_mse"] = _clip_mse(pred, gt_use)
                 meta["grpo_mse_clips"] = act_pack["mse_clips"]
                 ok += 1
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError(f"invalid reward input for trajectory {meta.get('traj_id')}: {exc}") from exc
 
         # task reward mode for traj-level: raw_succ or loo within original groups
         groups: Dict[str, List[int]] = {}
@@ -602,7 +626,11 @@ def main():
                     continue
                 with open(traj_path, "r", encoding="utf-8") as f:
                     tj = json.load(f)
+                if tj.get("sampling_backend") == "remote_sim" and tj.get("pose_source") != "simulator_observed":
+                    raise ValueError("remote_sim reward requires observed execution poses")
                 pred_all = tj.get("relative_poses", {}).get("poses", [])
+                if len(pred_all) != clip_len * num_clips:
+                    raise ValueError("reward requires a complete observed trajectory")
                 seg_lp = tj.get("sample_logprob_segments", None)
                 seg_tr = tj.get("trace_files", None)
                 if not isinstance(seg_lp, list) or len(seg_lp) < num_clips:
@@ -613,8 +641,7 @@ def main():
                 gt_path = meta.get("gt_pose_json", "")
                 if not gt_path or not os.path.exists(gt_path):
                     continue
-                gt = _load_gt_poses(gt_path)
-                gt_rel = _to_relative_cmdeg(gt) if isinstance(gt, list) else []
+                gt_rel = _gt_in_initial_frame(gt_path, str(meta.get("gt_pose_frame", "initial_body")))
                 gt_use_all = gt_rel[1:] if isinstance(gt_rel, list) and len(gt_rel) > 1 else []
 
                 gid_base = str(meta.get(task_id_key, "")) or f"task_{idx:06d}"
@@ -757,8 +784,8 @@ def main():
                     clip_meta["grpo_reward_decay"] = float(w)
                     out_rows.append(clip_meta)
                     ok += 1
-            except Exception:
-                continue
+            except Exception as exc:
+                raise RuntimeError(f"invalid reward input for trajectory {meta.get('traj_id')}: {exc}") from exc
 
         # Group LOO baseline for task reward at clip group granularity.
         groups: Dict[str, List[int]] = {}
@@ -869,6 +896,8 @@ def main():
                 out_rows[i]["grpo_rank_final"] = float(rank01[j])
                 out_rows[i]["grpo_adv_final"] = float(final_w[j])
 
+    if not out_rows:
+        raise RuntimeError("reward produced no valid replay rows")
     _print_final_weight_summary(out_rows, out_path)
     with open(out_path, "w", encoding="utf-8") as fout:
         for meta in out_rows:

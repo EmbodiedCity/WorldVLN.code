@@ -37,6 +37,13 @@ from infinity.trainer import get_trainer
 # from infinity.utils.mfu.mfu import mfutool
 
 def build_everything_from_args(args: arg_util.Args, saver):
+    if int(getattr(args, 'grpo_fsdp_cpu_offload', 0)):
+        if str(args.trainer_type).lower() != 'grpo' or str(args.grpo_new_logprob_mode) != 'trace_replay' or not args.zero:
+            raise ValueError('grpo_fsdp_cpu_offload requires exact GRPO trace_replay with FSDP (zero>0)')
+        if int(args.ac) not in (1, 2):
+            raise ValueError('grpo_fsdp_cpu_offload supports only ac=1 or ac=2 with the controlled FSDP no_sync path')
+        if str(getattr(args, 'hybrid_step_on_role', '') or '').strip():
+            raise ValueError('grpo_fsdp_cpu_offload requires fixed ac stepping; hybrid_step_on_role is unsupported')
     # set seed
     args.set_initial_seed(benchmark=True)
     # build tokenizer
@@ -93,6 +100,11 @@ def build_everything_from_args(args: arg_util.Args, saver):
         if args.rush_omnistore_resume == resume_path:
             global_it = 0
         auto_resume_info, acc_str, eval_milestone, trainer_state, args_state =  info, '[no acc str]', [], {}, {}
+
+    if global_it > 0:
+        # A resumed policy has already diverged from an older behavior trace.
+        # The initial on-policy equality gate applies only before its first update.
+        trainer._strict_policy_has_updated = True
         
     del vae_local, gpt_uncompiled, gpt_wo_ddp, gpt_ddp, gpt_wo_ddp_ema, gpt_ddp_ema, gpt_optim
     dist.barrier()
@@ -129,12 +141,12 @@ def build_model_optimizer(args):
     
     if args.rush_resume:
         print(f"{args.rush_resume=}")
-        cpu_d = torch.load(args.rush_resume, 'cpu')
+        from infinity.utils.checkpoint_io import load_checkpoint_cpu, extract_policy_state_dict
+        cpu_d = load_checkpoint_cpu(args.rush_resume)
+        state_dict = extract_policy_state_dict(cpu_d)
         if 'trainer' in cpu_d:
-            state_dict = cpu_d['trainer']['gpt_fsdp']
             ema_state_dict = cpu_d['trainer'].get('gpt_ema_fsdp', state_dict)
         else:
-            state_dict = cpu_d
             ema_state_dict = state_dict
         def drop_unfit_weights(state_dict):
             if 'word_embed.weight' in state_dict and (state_dict['word_embed.weight'].shape[1] != gpt_wo_ddp.word_embed.in_features):
@@ -178,11 +190,31 @@ def build_model_optimizer(args):
         from transformers.modeling_utils import load_sharded_checkpoint
         load_sharded_checkpoint(gpt_wo_ddp, args.torchshard_resume, strict=False)
 
-    apply_stageb_partial_freeze(
+    freeze_summary = apply_stageb_partial_freeze(
         gpt_wo_ddp,
         args.freeze_chunk_prefix,
         bool(args.partial_freeze_print_summary),
     )
+
+    if str(args.trainer_type).lower() == 'grpo':
+        block_dtype = str(getattr(args, 'grpo_block_dtype', 'float32')).lower()
+        if block_dtype not in ('bfloat16', 'float32'):
+            raise ValueError('grpo_block_dtype must be bfloat16 or float32')
+        if block_dtype == 'bfloat16' and freeze_summary['trainable_chunk_indices']:
+            raise ValueError('trainable backbone chunks require grpo_block_dtype=float32 for optimizer master weights; optional BF16 FSDP forwards use grpo_fsdp_compute_dtype=bfloat16 with matching BF16 Stage A traces')
+        dtype = torch.bfloat16 if block_dtype == 'bfloat16' else torch.float32
+        # Match the behavior loader exactly: only transformer blocks change
+        # dtype; output norms/heads and the other root parameters stay FP32.
+        for block in gpt_wo_ddp.unregistered_blocks:
+            block.to(dtype=dtype)
+        compute_dtype = str(getattr(args, 'grpo_fsdp_compute_dtype', 'none')).lower()
+        if compute_dtype not in ('none', 'bfloat16'):
+            raise ValueError('grpo_fsdp_compute_dtype must be none or bfloat16')
+        if compute_dtype == 'bfloat16' and (not args.zero or block_dtype != 'float32' or int(args.fp16) != 2):
+            raise ValueError('BF16 FSDP chunk compute requires zero>0, FP32 block masters, and fp16=2 (BF16 AMP)')
+        if compute_dtype == 'bfloat16' and args.use_fsdp_model_ema:
+            raise ValueError('BF16 chunk compute is not yet validated with FSDP model EMA')
+        print(f'[strict-grpo] transformer_master_dtype={block_dtype}, fsdp_chunk_compute_dtype={compute_dtype}, optimization_scope={freeze_summary["mode"]}', flush=True)
 
     ndim_dict = {name: para.ndim for name, para in gpt_wo_ddp.named_parameters() if para.requires_grad}
     
@@ -193,7 +225,7 @@ def build_model_optimizer(args):
 
     gpt_ddp_ema = None
     if args.zero:
-        from torch.distributed.fsdp import ShardingStrategy
+        from torch.distributed.fsdp import ShardingStrategy, CPUOffload
         from torch.distributed.fsdp.wrap import ModuleWrapPolicy
         from torch.distributed.device_mesh import init_device_mesh
 
@@ -202,7 +234,11 @@ def build_model_optimizer(args):
             auto_wrap_policy = ModuleWrapPolicy([type(gpt_wo_ddp.unregistered_blocks[0]), ])
         else:
             auto_wrap_policy = ModuleWrapPolicy([MultipleLayers, ])
-        
+        if str(args.trainer_type).lower() == 'grpo' and getattr(args, 'grpo_fsdp_compute_dtype', 'none') == 'bfloat16':
+            from infinity.utils.fsdp_grpo import chunk_mixed_precision_policy
+            chunk_type = type(gpt_wo_ddp.unregistered_blocks[0]) if gpt_wo_ddp.num_block_chunks == 1 else MultipleLayers
+            auto_wrap_policy = chunk_mixed_precision_policy(chunk_type)
+
         if args.enable_hybrid_shard:
             sharding_strategy = ShardingStrategy.HYBRID_SHARD if args.zero == 3 else ShardingStrategy._HYBRID_SHARD_ZERO2
             world_size = dist.get_world_size()
@@ -217,18 +253,24 @@ def build_model_optimizer(args):
         if args.fsdp_init_device == 'cpu':
             gpt_wo_ddp = gpt_wo_ddp.cpu()
 
+        cpu_offload = bool(int(getattr(args, 'grpo_fsdp_cpu_offload', 0)))
         gpt_ddp: FSDP = FSDP(
             gpt_wo_ddp, 
             device_id=dist.get_local_rank(),
             sharding_strategy=sharding_strategy, 
             mixed_precision=None,
+            cpu_offload=CPUOffload(offload_params=True) if cpu_offload else None,
             auto_wrap_policy=auto_wrap_policy, 
             use_orig_params=True, 
             sync_module_states=True, 
             limit_all_gathers=True,
             device_mesh=device_mesh,
-        ).to(args.device)
-        
+        )
+        # FSDP places offloaded master parameters on CPU itself. A subsequent
+        # .to(cuda) would undo that ownership and break its offload lifecycle.
+        if not cpu_offload:
+            gpt_ddp = gpt_ddp.to(args.device)
+
         if args.use_fsdp_model_ema:
             gpt_wo_ddp_ema = gpt_wo_ddp_ema.to(args.device)
             gpt_ddp_ema: FSDP = FSDP(
@@ -307,6 +349,10 @@ def main_train(args: arg_util.Args):
     # (e.g. different GPU count / dataloader worker flooring / token_len changes).
     train_dataset = build_dataset(args)
     iters_train = len(train_dataset)
+    if iters_train <= 0:
+        raise RuntimeError('training dataset yields no batches; check replay metadata, workers, and batch size')
+    if int(args.max_train_iters) > 0 and int(args.max_train_iters) % int(args.ac) != 0:
+        raise ValueError('max_train_iters must be divisible by ac so the requested run ends after an optimizer update')
     if int(getattr(args, "save_model_iters_freq", 0)) <= 0:
         args.save_model_iters_freq = int(iters_train)
         print(f'[PT info] auto save_model_iters_freq={args.save_model_iters_freq} (once per epoch)')
@@ -421,12 +467,6 @@ def train_one_epoch(
             speed_ls.append((time.time() - last_t_perf) / FREQ)
             last_t_perf = time.time()
 
-        if (g_it+1) % args.save_model_iters_freq == 0:
-            if args.checkpoint_type == 'torch':
-                saver.sav(args=args, g_it=(g_it+1), next_ep=epoch, next_it=it+1, trainer=trainer, acc_str=f'[todo]', eval_milestone=None, also_save_to=None, best_save_to=None)
-            elif args.checkpoint_type == 'omnistore':
-                saver.sav(args=args, global_it=(g_it+1), next_ep=epoch, next_it=it+1, fsdp_object=trainer.gpt, optimizer_object=trainer.gpt_opt.optimizer, acc_str=None, eval_milestone=None)
-        
         with maybe_record_function('before_train'):
             # [get data]
             images, captions, raw_features_bcthw, feature_cache_files4images, media = data['images'], data['captions'], data['raw_features_bcthw'], data['feature_cache_files4images'], data['media']
@@ -452,7 +492,17 @@ def train_one_epoch(
             hybrid_roles = data.get('hybrid_roles', None)
 
             # # [prepare text features]
-            if args.text_tokenizer_type == 'flan_t5':
+            strict_trace_batch = (
+                str(getattr(args, 'grpo_new_logprob_mode', 'trace_replay')) == 'trace_replay'
+                and hybrid_roles and all(str(role).lower() == 'grpo' for role in hybrid_roles)
+            )
+            if strict_trace_batch:
+                # The exact encoded text is part of the sampling trace. Do not
+                # re-tokenize an augmented caption or load a second condition.
+                text_encoder.to('cpu')
+                text_cond_tuple = None
+            elif args.text_tokenizer_type == 'flan_t5':
+                text_encoder.to(args.device)
                 tokens = text_tokenizer(text=captions, max_length=text_tokenizer.model_max_length, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
                 input_ids = tokens.input_ids.cuda(non_blocking=True)
                 mask = tokens.attention_mask.cuda(non_blocking=True)
@@ -487,7 +537,7 @@ def train_one_epoch(
                 last_touch = time.time()
                         
             # [get scheduled hyperparameters]
-            progress = g_it / (max_it - 1)
+            progress = g_it / max(1, max_it - 1)
             clip_decay_ratio = (0.3 ** (20 * progress) + 0.2) if args.cdec else 1
             
             stepping = (g_it + 1) % args.ac == 0
@@ -500,7 +550,12 @@ def train_one_epoch(
                 stepping = role0 == step_on_role
             step_cnt += int(stepping)
         
-        with maybe_record_function('in_training'):
+        # CPU-offloaded FSDP gradients may accumulate only inside no_sync.
+        # Include both forward and backward, then sync on the stepping batch.
+        accumulation_context = (trainer.gpt.no_sync() if
+                                int(getattr(args, 'grpo_fsdp_cpu_offload', 0)) and not stepping
+                                else nullcontext())
+        with maybe_record_function('in_training'), accumulation_context:
             grad_norm_t, scale_log2_t = trainer.train_step(
                 epoch=epoch, 
                 it=it, 
@@ -538,6 +593,19 @@ def train_one_epoch(
         
         with maybe_record_function('after_train'):
             me.update(tlr=args.tlr)
+            reached_limit = stop_global_it_exclusive is not None and g_it + 1 >= stop_global_it_exclusive
+            final_iteration = epoch + 1 == int(args.epoch) and it + 1 == iters_train
+            # Save the parameters AFTER the labeled update. Always preserve a
+            # bounded smoke run's final update even when its length is shorter
+            # than the ordinary checkpoint interval.
+            if stepping and ((g_it + 1) % args.save_model_iters_freq == 0 or reached_limit or final_iteration):
+                if args.checkpoint_type == 'torch':
+                    saver.sav(args=args, g_it=g_it+1, next_ep=epoch, next_it=it+1, trainer=trainer, acc_str='[post-update]', eval_milestone=None, also_save_to=None, best_save_to=None)
+                elif args.checkpoint_type == 'omnistore':
+                    saver.sav(args=args, global_it=g_it+1, next_ep=epoch, next_it=it+1, fsdp_object=trainer.gpt, optimizer_object=trainer.gpt_opt.optimizer, acc_str=None, eval_milestone=None)
+            if reached_limit:
+                stop_after_max_iters = True
+                break
     # ============================================= iteration loop ends =============================================
     
     me.synchronize_between_processes()

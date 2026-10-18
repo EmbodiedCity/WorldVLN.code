@@ -9,6 +9,10 @@ The simulator-side service is implemented by runtime/client.py in service mode. 
 - GET /health
 - POST /reset
 - POST /step_actions
+- POST /abort (matching session only)
+
+For exact policy replay, checkpoint precision and a small training update,
+see [Online RL guide](./online_rl.md).
 
 ## Start the Service
 
@@ -19,6 +23,7 @@ python runtime/client.py \
   --mode service \
   --host 0.0.0.0 \
   --port 8765 \
+  --action_frame body --body_apply_order trans_first \
   --task_json_root /path/to/uavflow_tasks/select_from_train_jsons
 ```
 
@@ -59,18 +64,18 @@ export CHECKPOINTS_DIR=/path/to/checkpointsinf
 export INFINITY_CKPT=/path/to/infinity/global_step_xxx.pth
 export ACTIONHEAD_CKPT=/path/to/actionhead/checkpoint_last.pth
 export ACTIONHEAD_RUN_CONFIG=/path/to/actionhead/run_config.json
-UAVFLOW_STAGEA_ROLLOUT_BACKEND=remote_sim
-UAVFLOW_SIMULATOR_BASE_URL=http://127.0.0.1:18765
+export UAVFLOW_STAGEA_ROLLOUT_BACKEND=remote_sim
+export UAVFLOW_SIMULATOR_BASE_URL=http://127.0.0.1:18765
 export UAVFLOW_SIMULATOR_TIMEOUT_S=120
-UAVFLOW_TASK_JSON_ROOT=/path/to/uavflow_tasks/select_from_train_jsons
-STAGEA_NPROC=1
+export UAVFLOW_TASK_JSON_ROOT=/path/to/uavflow_tasks/select_from_train_jsons
+export STAGEA_NPROC=1
 
 export RUN_ID=rl_rollout_smoke_$(date +%Y%m%d_%H%M%S)
 
 bash scripts/run_stagea_collect.sh \
   RUN_ID=${RUN_ID} \
   TOP_N=1 \
-  K_CAND=1 \
+  K_CAND=2 \
   STAGEA_NPROC=1 \
   STAGEA_PROGRESS_EVERY_N=1
 ```

@@ -27,10 +27,10 @@ case "${PARTIAL_FREEZE_MODE}" in
   smoke)
     default_freeze_chunk_prefix=5
     default_workers=2
-    default_kl_beta=0.9
+    default_kl_beta=0.0
     default_ratio_eps=0.02
     default_adv_clip=1.0
-    default_aux_sft_coef=0.15
+    default_aux_sft_coef=0.0
     default_max_train_iters=1200
     default_save_model_iters_freq=150
     default_lambda_act=0.3
@@ -46,10 +46,10 @@ case "${PARTIAL_FREEZE_MODE}" in
   main)
     default_freeze_chunk_prefix=4
     default_workers=4
-    default_kl_beta=0.1
+    default_kl_beta=0.0
     default_ratio_eps=0.15
     default_adv_clip=5.0
-    default_aux_sft_coef=0.02
+    default_aux_sft_coef=0.0
     default_max_train_iters=0
     default_save_model_iters_freq=300
     default_lambda_act=1.0
@@ -71,7 +71,7 @@ esac
 export FREEZE_CHUNK_PREFIX="${FREEZE_CHUNK_PREFIX:-${default_freeze_chunk_prefix}}"
 export PARTIAL_FREEZE_PRINT_SUMMARY="${PARTIAL_FREEZE_PRINT_SUMMARY:-1}"
 export INFINITY_GRPO_TRAIN_LAST_N_BLOCKS="${INFINITY_GRPO_TRAIN_LAST_N_BLOCKS:-0}"
-export GRPO_NEW_LOGPROB_MODE="${GRPO_NEW_LOGPROB_MODE:-trace_ce}"
+export GRPO_NEW_LOGPROB_MODE="${GRPO_NEW_LOGPROB_MODE:-trace_replay}"
 export GRPO_KL_BETA="${GRPO_KL_BETA:-${default_kl_beta}}"
 export GRPO_RATIO_EPS="${GRPO_RATIO_EPS:-${default_ratio_eps}}"
 export GRPO_ADV_CLIP="${GRPO_ADV_CLIP:-${default_adv_clip}}"

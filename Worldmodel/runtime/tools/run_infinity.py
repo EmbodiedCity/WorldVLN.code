@@ -121,6 +121,9 @@ def gen_one_example(
     context_info=None,
     noise_list=None,
     return_summed_code_only=False,
+    return_trace: bool = False,
+    return_logprob_by_clip: bool = True,
+    forced_idx_trace=None,
     mode='',
     former_clip_features=None,
     first_frame_features=None,
@@ -157,17 +160,34 @@ def gen_one_example(
             context_info=context_info,
             noise_list=noise_list,
             return_summed_code_only=return_summed_code_only,
+            return_trace=return_trace,
+            return_logprob_by_clip=return_logprob_by_clip,
+            forced_idx_trace=forced_idx_trace,
             mode=mode,
             former_clip_features=former_clip_features,
             first_frame_features=first_frame_features,
         )
+        if return_trace:
+            def _cpu_condition(tup):
+                if tup is None:
+                    return None
+                return tuple(v.detach().cpu() if isinstance(v, torch.Tensor) else v for v in tup)
+            info = out if isinstance(out, dict) else out[2]
+            info["text_cond_tuple"] = _cpu_condition(text_cond_tuple)
+            info["negative_text_cond_tuple"] = _cpu_condition(negative_label_B_or_BLT)
         if return_summed_code_only:
             return out
         else:
-            pred_multi_scale_bit_labels, img_list = out
+            trace_info = None
+            if return_trace and isinstance(out, tuple) and len(out) == 3:
+                pred_multi_scale_bit_labels, img_list, trace_info = out
+            else:
+                pred_multi_scale_bit_labels, img_list = out
             
     print(f"cost: {time.time() - sstt}, infinity cost={time.time() - stt}")
     img = img_list[0]
+    if return_trace:
+        return img, pred_multi_scale_bit_labels, trace_info
     return img, pred_multi_scale_bit_labels
 
 def get_prompt_id(prompt):
@@ -261,11 +281,19 @@ def load_transformer(vae, args):
             # Training checkpoints (global_step_*.pth) include optimizer/trainer states.
             # Never load the whole checkpoint onto CUDA, otherwise it can OOM even on 80G GPUs.
             # We load on CPU and then copy only model weights into the CUDA model.
-            state_dict = torch.load(model_path, map_location='cpu')
+            try:
+                state_dict = torch.load(model_path, map_location='cpu', weights_only=False, mmap=True)
+            except RuntimeError as exc:
+                # Legacy torch serialization does not support mmap; keep the CPU-only fallback.
+                if "mmap" not in str(exc).lower():
+                    raise
+                state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
             if 'trainer' in state_dict:
-                print(infinity_test.load_state_dict(state_dict['trainer']['gpt_fsdp']))
-            else:
-                print(infinity_test.load_state_dict(state_dict))
+                trainer_state = state_dict['trainer']
+                state_dict = next((trainer_state[key] for key in ('gpt_fsdp', 'gpt_wo_ddp') if key in trainer_state), None)
+                if state_dict is None:
+                    raise KeyError('checkpoint trainer has no gpt_fsdp or gpt_wo_ddp model weights')
+            print(infinity_test.load_state_dict(state_dict))
         elif args.checkpoint_type == 'torch_shard':
             from transformers.modeling_utils import load_sharded_checkpoint
             print(load_sharded_checkpoint(infinity_test, model_path, strict=False))

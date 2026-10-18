@@ -173,7 +173,7 @@ def _apply_action_to_pose_with_frame(
     action_dxdy_dz_droll_dyaw_dpitch: List[float],
     *,
     action_frame: str,
-    body_apply_order: str = "yaw_first",
+    body_apply_order: str = "trans_first",
     integrate_roll_pitch: bool = True,
 ) -> List[float]:
     """
@@ -489,57 +489,31 @@ def _wait_pose_settle(
         time.sleep(float(sleep_s))
 
 
-def _make_unrealcv_env(
-    *,
-    env_id: str,
-    time_dilation_value: int,
-    seed: int,
-    resolution_wh: Tuple[int, int],
-    ue_port: int,
-) -> Any:
-    try:
-        import gym  # type: ignore
-        import gym_unrealcv  # noqa: F401  # type: ignore
-        from gym_unrealcv.envs.wrappers import configUE, time_dilation  # type: ignore
-    except Exception as e:
-        raise SystemExit(f"mode=service/unrealcv requires gym & gym_unrealcv imports, but failed: {e}") from e
-
+def _make_unrealcv_env(*, env_id: str, time_dilation_value: int, seed: int,
+                      resolution_wh: Tuple[int, int], ue_port: int) -> Any:
+    import gym
+    import gym_unrealcv
+    from gym_unrealcv.envs.wrappers import configUE, time_dilation
     env = gym.make(str(env_id))
+    # Online navigation is a single-drone executor, not the two-agent tracking
+    # task. Track.reset dereferences target_id=1 after non-drone agents are removed.
+    import types
+    from gym_unrealcv.envs.base_env import UnrealCv_base
+    env.unwrapped.reset = types.MethodType(UnrealCv_base.reset, env.unwrapped)
     if int(time_dilation_value) > 0:
         env = time_dilation.TimeDilationWrapper(env, int(time_dilation_value))
-    try:
-        env.unwrapped.agents_category = ["drone"]
-    except Exception:
-        pass
-    env = configUE.ConfigUEWrapper(env, resolution=(int(resolution_wh[0]), int(resolution_wh[1])))
-    try:
-        env.seed(int(seed))
-    except Exception:
-        pass
-    try:
-        if int(ue_port) > 0:
-            try:
-                env.unwrapped.ue_binary.write_port(int(ue_port))
-            except Exception:
-                pass
-        env.reset()
-        env.unwrapped.unrealcv.set_viewport(env.unwrapped.player_list[0])
-        env.unwrapped.unrealcv.set_phy(env.unwrapped.player_list[0], 0)
-    except Exception:
-        pass
+    env.unwrapped.agents_category = ["drone"]
+    env = configUE.ConfigUEWrapper(env, resolution=resolution_wh)
+    env.seed(int(seed))
+    if int(ue_port) > 0:
+        env.unwrapped.ue_binary.write_port(int(ue_port))
+    env.reset()
+    env.unwrapped.unrealcv.set_viewport(env.unwrapped.player_list[0])
+    env.unwrapped.unrealcv.set_phy(env.unwrapped.player_list[0], 0)
     return env
 
 
-def _reset_unrealcv_env(env: Any) -> None:
-    try:
-        env.reset()
-    except Exception:
-        pass
-    try:
-        env.unwrapped.unrealcv.set_viewport(env.unwrapped.player_list[0])
-        env.unwrapped.unrealcv.set_phy(env.unwrapped.player_list[0], 0)
-    except Exception:
-        pass
+
 
 
 def _resolve_service_task_fields(payload: Dict[str, Any], task_json_root: str) -> Tuple[str, List[float], Optional[Dict[str, Any]], str, str]:
@@ -581,224 +555,31 @@ def _resolve_service_task_fields(payload: Dict[str, Any], task_json_root: str) -
     return prompt, init6, resolved_obj, task_id, os.path.basename(task_json_path) if task_json_path else ""
 
 
-def _capture_env_data_url(env: Any, *, image_codec: str, jpeg_quality: int) -> str:
-    img = _capture_unrealcv_lit_pil(env, cam_id=0)
-    return _pil_to_data_url(img, codec=str(image_codec), quality=int(jpeg_quality))
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status_code: int, obj: Dict[str, Any]) -> None:
-    raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-    handler.send_response(int(status_code))
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(raw)))
-    handler.end_headers()
-    handler.wfile.write(raw)
 
 
-def _service_reset(
-    *,
-    payload: Dict[str, Any],
-    env: Any,
-    task_json_root: str,
-    yaw_offset_deg: float,
-    image_codec: str,
-    jpeg_quality: int,
-) -> Tuple[UnrealcvServiceSession, Dict[str, Any]]:
-    session_id = str(payload.get("session_id", "") or "").strip()
-    if not session_id:
-        raise ValueError("session_id is required")
-    prompt, init_pose, obj_info, task_id, task_json_name = _resolve_service_task_fields(payload, task_json_root)
-
-    _reset_unrealcv_env(env)
-    _init_marker_objects_if_needed(env)
-    _create_obj_if_needed_unrealcv(env, obj_info)
-    _apply_pose_unrealcv(env, pose_xyz_rpy=init_pose, yaw_offset_deg=float(yaw_offset_deg))
-    _wait_pose_settle(env, target_pose_xyz_rpy=init_pose, yaw_offset_deg=float(yaw_offset_deg))
-    time.sleep(1.0)
-
-    session = UnrealcvServiceSession(
-        session_id=session_id,
-        prompt=prompt,
-        current_pose=list(init_pose),
-        task_id=str(task_id),
-        frame_index=1,
-        max_frames=int(payload.get("max_frames", 49) or 49),
-    )
-    return session, {
-        "session_id": session_id,
-        "task_id": str(task_id),
-        "task_json_name": str(task_json_name),
-        "instruction": prompt,
-        "images_base64": [_capture_env_data_url(env, image_codec=image_codec, jpeg_quality=int(jpeg_quality))],
-        "frame_indices": [1],
-        "world_poses": [list(session.current_pose)],
-        "done": False,
-    }
 
 
-def _service_step_actions(
-    *,
-    payload: Dict[str, Any],
-    env: Any,
-    session: UnrealcvServiceSession,
-    action_frame: str,
-    body_apply_order: str,
-    yaw_offset_deg: float,
-    image_codec: str,
-    jpeg_quality: int,
-) -> Dict[str, Any]:
-    session_id = str(payload.get("session_id", "") or "").strip()
-    if not session_id:
-        raise ValueError("session_id is required")
-    if session_id != str(session.session_id):
-        raise ValueError(f"active session mismatch: expected {session.session_id}, got {session_id}")
-    actions = payload.get("actions", None)
-    if not isinstance(actions, list) or len(actions) <= 0:
-        raise ValueError("actions must be a non-empty list")
-
-    images_base64: List[str] = []
-    frame_indices: List[int] = []
-    world_poses: List[List[float]] = []
-    for action in actions:
-        if not (isinstance(action, list) and len(action) == 6):
-            raise ValueError("each action must be a 6D list")
-        next_pose = _apply_action_to_pose_with_frame(
-            session.current_pose,
-            [float(x) for x in action[:6]],
-            action_frame=str(action_frame),
-            body_apply_order=str(body_apply_order),
-            integrate_roll_pitch=False,
-        )
-        session.current_pose[0] = float(next_pose[0])
-        session.current_pose[1] = float(next_pose[1])
-        session.current_pose[2] = float(next_pose[2])
-        session.current_pose[4] = float(next_pose[4])
-        _apply_pose_unrealcv(env, pose_xyz_rpy=session.current_pose, yaw_offset_deg=float(yaw_offset_deg))
-        session.frame_index += 1
-        frame_indices.append(int(session.frame_index))
-        world_poses.append(list(session.current_pose))
-        images_base64.append(_capture_env_data_url(env, image_codec=image_codec, jpeg_quality=int(jpeg_quality)))
-
-    return {
-        "session_id": session.session_id,
-        "task_id": session.task_id,
-        "images_base64": images_base64,
-        "frame_indices": frame_indices,
-        "world_poses": world_poses,
-        "done": bool(int(session.frame_index) >= int(session.max_frames)),
-    }
 
 
-def _make_service_handler(
-    *,
-    env: Any,
-    state: Dict[str, Optional[UnrealcvServiceSession]],
-    task_json_root: str,
-    yaw_offset_deg: float,
-    action_frame: str,
-    body_apply_order: str,
-    image_codec: str,
-    jpeg_quality: int,
-):
-    class _ServiceHandler(BaseHTTPRequestHandler):
-        server_version = "UAVFlowUnrealCVService/0.1"
-
-        def log_message(self, format: str, *args) -> None:  # noqa: A003
-            return
-
-        def do_GET(self) -> None:  # noqa: N802
-            if self.path.rstrip("/") != "/health":
-                _json_response(self, 404, {"error": f"unknown path: {self.path}"})
-                return
-            with _SERVICE_LOCK:
-                session = state.get("session")
-                _json_response(
-                    self,
-                    200,
-                    {
-                        "status": "ok",
-                        "active_session": str(session.session_id) if session else "",
-                        "frame_index": int(session.frame_index) if session else 0,
-                    },
-                )
-
-        def do_POST(self) -> None:  # noqa: N802
-            try:
-                content_len = int(self.headers.get("Content-Length", "0") or "0")
-                payload = json.loads(self.rfile.read(content_len).decode("utf-8") or "{}")
-                if not isinstance(payload, dict):
-                    raise ValueError("payload must be a json object")
-                with _SERVICE_LOCK:
-                    if self.path.rstrip("/") == "/reset":
-                        session, resp = _service_reset(
-                            payload=payload,
-                            env=env,
-                            task_json_root=task_json_root,
-                            yaw_offset_deg=float(yaw_offset_deg),
-                            image_codec=str(image_codec),
-                            jpeg_quality=int(jpeg_quality),
-                        )
-                        state["session"] = session
-                        _json_response(self, 200, resp)
-                        return
-                    if self.path.rstrip("/") == "/step_actions":
-                        session = state.get("session")
-                        if session is None:
-                            raise ValueError("no active session; call /reset first")
-                        resp = _service_step_actions(
-                            payload=payload,
-                            env=env,
-                            session=session,
-                            action_frame=str(action_frame),
-                            body_apply_order=str(body_apply_order),
-                            yaw_offset_deg=float(yaw_offset_deg),
-                            image_codec=str(image_codec),
-                            jpeg_quality=int(jpeg_quality),
-                        )
-                        _json_response(self, 200, resp)
-                        return
-                _json_response(self, 404, {"error": f"unknown path: {self.path}"})
-            except Exception as e:
-                _json_response(self, 500, {"error": str(e)})
-
-    return _ServiceHandler
 
 
-def run_env_service(
-    *,
-    host: str,
-    port: int,
-    env: Any,
-    task_json_root: str,
-    yaw_offset_deg: float,
-    action_frame: str,
-    body_apply_order: str,
-    image_codec: str,
-    jpeg_quality: int,
-) -> None:
-    state: Dict[str, Optional[UnrealcvServiceSession]] = {"session": None}
-    handler = _make_service_handler(
-        env=env,
-        state=state,
-        task_json_root=task_json_root,
-        yaw_offset_deg=float(yaw_offset_deg),
-        action_frame=str(action_frame),
-        body_apply_order=str(body_apply_order),
-        image_codec=str(image_codec),
-        jpeg_quality=int(jpeg_quality),
-    )
-    server = ThreadingHTTPServer((str(host), int(port)), handler)
-    print(f"[env_service] listening on http://{host}:{port}")
+def run_env_service(*, host: str, port: int, env: Any, task_json_root: str,
+                    yaw_offset_deg: float, action_frame: str, body_apply_order: str,
+                    image_codec: str, jpeg_quality: int) -> None:
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        try:
-            env.close()
-        except Exception:
-            pass
+        from .sim_service import run_env_service as run_verified_service
+    except ImportError:
+        from sim_service import run_env_service as run_verified_service
+    run_verified_service(
+        host=host, port=port, env=env, task_json_root=task_json_root,
+        yaw_offset_deg=yaw_offset_deg, action_frame=action_frame,
+        body_apply_order=body_apply_order, image_codec=image_codec,
+        jpeg_quality=jpeg_quality, resolve_task=_resolve_service_task_fields,
+        capture_image=_capture_unrealcv_lit_pil, encode_image=_pil_to_data_url,
+    )
+
 
 
 def _split_action_to_substeps(action6: List[float], substeps: int) -> List[List[float]]:
@@ -832,7 +613,7 @@ def run_one_task_unrealcv(
     yaw_offset_deg: float = -180.0,
     allow_future_last_segment: bool = False,
     action_frame: str = "world",
-    body_apply_order: str = "yaw_first",
+    body_apply_order: str = "trans_first",
     save_images: bool = True,
 ) -> None:
     """
@@ -1226,7 +1007,7 @@ def run_one_route(
     prefix_mode: bool = False,
     allow_future_last_segment: bool = False,
     action_frame: str = "world",
-    body_apply_order: str = "yaw_first",
+    body_apply_order: str = "trans_first",
     timeout_s: int = 120,
     image_codec: str = "jpeg",
     jpeg_quality: int = 90,
@@ -1455,12 +1236,18 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="(mode=unrealcv) Random seed.")
     ap.add_argument("--resolution", type=str, default="256,256", help="(mode=unrealcv) Capture resolution as 'W,H'. Default 256,256.")
     ap.add_argument("--ue_port", type=int, default=0, help="(mode=unrealcv) If >0, set UnrealCV socket base port in unrealcv.ini before launching UE. Useful to run multiple UE instances in parallel (e.g. 9393/9394).")
+    ap.add_argument("--pose_timeout_s", type=float, default=5.0)
+    ap.add_argument("--pose_pos_tol_cm", type=float, default=2.0)
+    ap.add_argument("--pose_angle_tol_deg", type=float, default=1.5)
+    ap.add_argument("--stabilization_renders", type=int, default=2)
+    ap.add_argument("--stabilization_sleep_s", type=float, default=0.05)
+    ap.add_argument("--object_verify_tol_cm", type=float, default=50.0)
     ap.add_argument("--host", type=str, default="0.0.0.0", help="(mode=service) HTTP listen host.")
     ap.add_argument("--port", type=int, default=8765, help="(mode=service) HTTP listen port.")
     ap.add_argument("--task_json_root", type=str, default="", help="(mode=service) Optional local select_from_train_jsons directory for resolving task_id -> task json on the simulator machine.")
     ap.add_argument("--yaw_offset_deg", type=float, default=-180.0, help="(mode=unrealcv) Yaw offset applied when calling UnrealCV set_rotation. batch_run_act_all.py uses -180.")
     ap.add_argument("--action_frame", type=str, default="body", choices=["world", "body"], help="How to interpret dx/dy when integrating poses/logs: world=direct add; body=dx,dy in body forward/right rotated by yaw.")
-    ap.add_argument("--body_apply_order", type=str, default="yaw_first", choices=["yaw_first", "trans_first", "midpoint"], help="Only for --action_frame=body. yaw_first: yaw+=dyaw then translate; trans_first: translate with old yaw then yaw+=dyaw; midpoint: translate with yaw+0.5*dyaw then yaw+=dyaw.")
+    ap.add_argument("--body_apply_order", type=str, default="trans_first", choices=["yaw_first", "trans_first", "midpoint"], help="Only for --action_frame=body. yaw_first: yaw+=dyaw then translate; trans_first: translate with old yaw then yaw+=dyaw; midpoint: translate with yaw+0.5*dyaw then yaw+=dyaw.")
     ap.add_argument("--max_actions", type=int, default=48, help="(mode=unrealcv) If >0, stop after executing this many actions (each action -> 1 captured frame). Default 48 (i.e. 1+48=49 frames total). Set 0 to use --num_frames bound instead.")
     ap.add_argument("--server_url", type=str, default="http://127.0.0.1:8002", help="Server base URL (no trailing endpoint).")
     ap.add_argument("--out_dir", type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "runtime_cache")), help="Where to write per-session json outputs.")
@@ -1516,6 +1303,14 @@ def main():
             resolution_wh=(int(res_w), int(res_h)),
             ue_port=int(args.ue_port),
         )
+        env.unwrapped._service_settings = {
+            key: getattr(args, key) for key in (
+                "pose_timeout_s", "pose_pos_tol_cm", "pose_angle_tol_deg",
+                "stabilization_renders", "stabilization_sleep_s", "object_verify_tol_cm"
+            )
+        }
+        if args.stabilization_renders < 1 or args.stabilization_sleep_s < 0:
+            raise SystemExit("stabilization_renders must be >=1 and sleep must be nonnegative")
         run_env_service(
             host=str(args.host),
             port=int(args.port),

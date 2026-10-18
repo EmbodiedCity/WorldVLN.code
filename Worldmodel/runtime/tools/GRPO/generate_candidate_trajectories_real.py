@@ -43,15 +43,19 @@ def _load_api_module(py_path: str):
     return mod
 
 
+def _pose_math():
+    # Resolve from repository layout, never a machine-specific workspace path.
+    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "action_aware_grpo", "runtime", "pose_math.py"))
+    spec = importlib.util.spec_from_file_location("worldvln_pose_math", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load common pose functions: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _integrate_actions(actions: List[List[float]]) -> List[List[float]]:
-    pose = [0.0] * 6
-    out = []
-    for a in actions:
-        if len(a) != 6:
-            continue
-        pose = [pose[i] + float(a[i]) for i in range(6)]
-        out.append(list(pose))
-    return out
+    return _pose_math().integrate_body_actions(actions)[1:]
 
 
 def _all_finite_6d(actions: List[List[float]]) -> bool:
@@ -81,25 +85,28 @@ def _all_finite(xs: List[float]) -> bool:
     return True
 
 
-def _require_trace_ce_ok(trace_paths: List[str]) -> None:
-    """
-    Strict GRPO safety guard:
-    When StageB uses trace_ce for new_logprob, StageA must record old_logprob in the same definition
-    (teacher-forcing CE/full-softmax). If StageA falls back to sampling-time logprob, PPO ratio/KL becomes
-    inconsistent and can collapse video quality.
-    """
-    mode = (os.environ.get("INFINITY_STAGEA_OLD_LOGPROB_MODE", "") or "").strip().lower()
-    strict = int((os.environ.get("INFINITY_STAGEA_OLD_LOGPROB_STRICT", "0") or "0").strip() or "0") == 1
-    if not (mode == "trace_ce" and strict):
-        return
+def _require_policy_trace_ok(trace_paths: List[str]) -> None:
+    """Reject incomplete/approximate traces before they can become training data."""
     import torch  # local import to keep startup light
-
+    if len(trace_paths) != 3:
+        raise RuntimeError("a rollout must have three complete policy traces")
     for p in trace_paths:
         if not p or (not os.path.exists(p)):
-            continue
-        tr = torch.load(p, map_location="cpu")
-        if tr.get("sample_logprob_trace_ce", None) is None:
-            raise RuntimeError(f"trace_ce strict: missing sample_logprob_trace_ce in trace: {p}")
+            raise RuntimeError(f"missing policy trace: {p}")
+        tr = torch.load(p, map_location="cpu", weights_only=False)
+        target = int(tr.get("clipid_target", -1))
+        counts = tr.get("sample_token_count_by_clip", [])
+        steps, clips, sampled = tr.get("idx_trace", []), tr.get("step_clipids", []), tr.get("step_is_sampled", [])
+        if int(tr.get("schema_version", 0)) < 3 or tr.get("old_logprob_mode") != "sampling" or tr.get("logprob_accumulation_dtype") != "float64":
+            raise RuntimeError(f"unsupported/approximate policy trace: {p}")
+        if not steps or len(steps) != len(clips) or len(steps) != len(sampled):
+            raise RuntimeError(f"policy token/clip/GT mask lengths differ: {p}")
+        if not 0 <= target < len(counts) or int(counts[target]) <= 0:
+            raise RuntimeError(f"target clip has no sampled policy tokens: {p}")
+        if not math.isfinite(float(tr["sample_logprob"])):
+            raise RuntimeError(f"non-finite policy likelihood: {p}")
+        if not isinstance(tr.get("text_cond_tuple"), (tuple, list)):
+            raise RuntimeError(f"missing actual behavior text encoding: {p}")
 
 
 def _make_req(**kwargs):
@@ -260,6 +267,11 @@ def _run_remote_sim_rollout(
     if isinstance(reset_resp.get("world_poses", None), list):
         sim_world_poses.extend(reset_resp["world_poses"])
 
+    contract = reset_resp.get("action_contract", {})
+    if contract.get("version") != _pose_math().ACTION_CONTRACT["version"]:
+        raise RuntimeError("simulator action contract mismatch; update client.py, sim_service.py and pose_math.py together")
+    if reset_resp.get("world_poses_source") != "simulator_observed":
+        raise RuntimeError("online reward requires simulator-observed poses")
     responses: List[Any] = []
     seg_exec_meta: List[Dict[str, Any]] = []
     images_for_model = list(init_images)
@@ -288,7 +300,7 @@ def _run_remote_sim_rollout(
         responses.append(resp)
 
         seg_actions = getattr(resp, "actions", None)
-        if not _all_finite_6d(seg_actions):
+        if not _all_finite_6d(seg_actions) or len(seg_actions) != 16:
             raise RuntimeError(f"invalid simulator-backend actions for segment {seg_i}")
 
         step_resp = _sim_step_actions(
@@ -305,6 +317,10 @@ def _run_remote_sim_rollout(
                 "done": bool(step_resp.get("done", False)),
             }
         )
+        if step_resp.get("world_poses_source") != "simulator_observed":
+            raise RuntimeError("simulator step did not return observed poses")
+        if len(step_resp.get("world_poses", [])) != 16:
+            raise RuntimeError("simulator step must return 16 observed poses")
         if isinstance(step_resp.get("world_poses", None), list):
             sim_world_poses.extend(step_resp["world_poses"])
         if seg_i < 2:
@@ -539,16 +555,26 @@ def main():
                         # Basic validity checks: finite actions/logprobs and existing trace file(s).
                         if (not _all_finite_6d(actions_try)) or (not _all_finite(seg_oldlp_try)):
                             raise RuntimeError("invalid rollout numbers (NaN/Inf/non-6D)")
-                        if not any((p and os.path.exists(p)) for p in seg_trace_try):
+                        if len(seg_trace_try) != 3 or not all((p and os.path.exists(p)) for p in seg_trace_try):
                             raise RuntimeError("missing trace files")
-                        # Strict trace_ce guard: trace files must contain sample_logprob_trace_ce.
-                        _require_trace_ce_ok(seg_trace_try)
+                        # Require complete sampling traces before scoring a real rollout.
+                        _require_policy_trace_ok(seg_trace_try)
 
                         # Success
                         seed = seed_try
                         sid = sid_try
                         break
                     except Exception as e:
+                        # Release only this attempt's simulator session. A failed
+                        # inference/partial step must not leave every retry stuck
+                        # behind the single-session reset guard.
+                        try:
+                            _http_post_json(
+                                str(args.simulator_base_url).rstrip("/") + "/abort",
+                                {"session_id": sid_try}, timeout_s=int(args.simulator_timeout_s),
+                            )
+                        except Exception as abort_error:
+                            print(f"[rollout] could not abort owned session {sid_try}: {abort_error}")
                         # Retry next attempt
                         r0 = r1 = r2 = None
                         if attempt == max_retry - 1:
@@ -559,7 +585,11 @@ def main():
                     aa = getattr(rr, "actions", None)
                     if isinstance(aa, list):
                         actions.extend(aa)
-                poses = _integrate_actions(actions)
+                commanded_poses = _integrate_actions(actions)
+                observed_world = backend_meta.get("simulator_world_poses", [])
+                if not isinstance(observed_world, list) or len(observed_world) != len(actions) + 1:
+                    raise RuntimeError("simulator must return one observed pose per frame, including reset")
+                poses = _pose_math().world_poses_to_initial(observed_world)[1:]
                 seg_old_logprobs: List[float] = []
                 seg_trace_paths: List[str] = []
                 for rr in (r0, r1, r2):
@@ -592,6 +622,9 @@ def main():
                     "prompt": prompt,
                     "num_actions": len(actions),
                     "actions": actions,
+                    "action_contract": _pose_math().ACTION_CONTRACT,
+                    "pose_source": "simulator_observed",
+                    "commanded_relative_poses": commanded_poses,
                     "relative_poses": {
                         "start_pose": [0.0] * 6,
                         "poses": poses,

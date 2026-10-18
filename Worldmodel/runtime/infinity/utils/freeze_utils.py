@@ -76,10 +76,10 @@ def apply_stageb_partial_freeze(model, freeze_chunk_prefix: int, print_summary: 
         raise ValueError(f'freeze_chunk_prefix must be >= 0, got {freeze_chunk_prefix}')
     if total_chunks <= 0:
         raise ValueError('partial freeze requires at least one transformer block container')
-    if freeze_chunk_prefix >= total_chunks:
+    if freeze_chunk_prefix > total_chunks:
         raise ValueError(
-            f'freeze_chunk_prefix={freeze_chunk_prefix} must be smaller than total_chunks={total_chunks} '
-            'so at least one chunk remains trainable'
+            f'freeze_chunk_prefix={freeze_chunk_prefix} must not exceed total_chunks={total_chunks}; '
+            'equality explicitly selects heads-only training'
         )
 
     if freeze_chunk_prefix == 0:
@@ -106,9 +106,11 @@ def apply_stageb_partial_freeze(model, freeze_chunk_prefix: int, print_summary: 
             getattr(model, module_name).requires_grad_(True)
 
     summary = summarize_parameter_status(model)
+    if not summary['trainable_params']:
+        raise ValueError('partial freeze leaves no trainable output heads')
     summary.update({
         'enabled': True,
-        'mode': 'chunk-prefix',
+        'mode': 'heads-only' if freeze_chunk_prefix == total_chunks else 'chunk-prefix',
         'freeze_chunk_prefix': freeze_chunk_prefix,
         'total_chunks': total_chunks,
         'block_container_name': block_container_name,

@@ -485,6 +485,10 @@ def _load_actionhead_stats(run_config_path: str) -> Dict[str, "np.ndarray"]:  # 
     assert np is not None
     with open(run_config_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+    if cfg.get("use_raw_for_labels") is not True:
+        raise ValueError("actionhead_ref_vit requires previous-body SE(3) labels (use_raw_for_labels=true)")
+    if int(cfg.get("window_size", 4)) != 4:
+        raise ValueError("actionhead_ref_vit requires a four-frame action-head checkpoint")
     stats = cfg.get("label_stats") or {}
     need = ("mean_angles", "std_angles", "mean_t", "std_t")
     for k in need:
@@ -495,6 +499,10 @@ def _load_actionhead_stats(run_config_path: str) -> Dict[str, "np.ndarray"]:  # 
     out["std_angles"] = np.asarray(stats["std_angles"], dtype=np.float32)
     out["mean_t"] = np.asarray(stats["mean_t"], dtype=np.float32)
     out["std_t"] = np.asarray(stats["std_t"], dtype=np.float32)
+    divisor = float(cfg.get("translation_divisor", 100.0))
+    if not math.isfinite(divisor) or divisor <= 0:
+        raise ValueError("action-head translation_divisor must be finite and positive")
+    out["translation_divisor"] = divisor
     return out
 
 
@@ -523,11 +531,11 @@ def _init_actionhead_model(*, ckpt_path: str, run_config_path: str) -> None:
         num_frames=4,
         attention_type="divided_space_time",
     )
-    ckpt = torch.load(os.path.abspath(ckpt_path), map_location="cpu")
+    ckpt = torch.load(os.path.abspath(ckpt_path), map_location="cpu", weights_only=False)
     sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing or unexpected:
-        print(f"[ActionHead] load_state_dict strict=False, missing={len(missing)} unexpected={len(unexpected)}")
+        raise RuntimeError(f"Action-head checkpoint mismatch: missing={missing}, unexpected={unexpected}")
     model.to(device).eval()
 
     _ah_model = model
@@ -998,6 +1006,7 @@ def _infer_summed_codes_for_step(
                         noise_list=None,
                         return_summed_code_only=True,
                         return_trace=True,
+                        return_logprob_by_clip=True,
                     )
             else:
                 out_gen = infinity_gen_one_example(  # type: ignore[misc]
@@ -1026,396 +1035,93 @@ def _infer_summed_codes_for_step(
                     noise_list=None,
                     return_summed_code_only=True,
                     return_trace=True,
+                    return_logprob_by_clip=True,
                 )
 
-        summed_codes = out_gen
-        if isinstance(out_gen, dict):
-            summed_codes = out_gen.get("summed_codes", None)
-            try:
-                slp = out_gen.get("sample_logprob", 0.0)
-                if isinstance(slp, torch.Tensor):
-                    trace_sample_logprob = float(slp.detach().to("cpu").item())
-                else:
-                    trace_sample_logprob = float(slp)
-            except Exception:
-                trace_sample_logprob = 0.0
-            # Prefer clip-aligned logprob for this segment when available.
-            try:
-                clipid_target = int(step_i) + 1
-                byc = out_gen.get("sample_logprob_by_clip", None)
-                if isinstance(byc, list) and len(byc) > clipid_target:
-                    v = byc[clipid_target]
-                    if isinstance(v, torch.Tensor):
-                        trace_sample_logprob = float(v.detach().to("cpu").item())
-                    else:
-                        trace_sample_logprob = float(v)
-            except Exception:
-                pass
-
-            # Keep a copy of sampling-time logprob (often guided by cfg/tau and full schedule).
-            trace_sample_logprob_sampling = float(trace_sample_logprob)
-            trace_sample_logprob_trace_ce = None
-
-            # Optional: compute old_logprob via teacher-forcing single forward (StageB trace_ce compatible).
-            # Enable by env:
-            #   INFINITY_STAGEA_OLD_LOGPROB_MODE=trace_ce
-            mode = (os.environ.get("INFINITY_STAGEA_OLD_LOGPROB_MODE", "") or "").strip().lower()
-            if mode == "trace_ce":
-                    strict = (os.environ.get("INFINITY_STAGEA_OLD_LOGPROB_STRICT", "0") or "0").strip()
-                    strict = int(strict) == 1
-                    import math as _math
-                    import json as _json
-                    import numpy as _np
-                    import torch.nn.functional as _F
-                    from infinity.schedules.dynamic_resolution import (  # type: ignore
-                        get_first_full_spatial_size_scale_index as _ffssi,
-                    )
-                    from infinity.schedules.infinity_elegant import (  # type: ignore
-                        get_visual_rope_embeds as _get_rope,
-                        interpolate as _interp,
-                    )
-
-                    idx_trace = out_gen.get("idx_trace", None)
-                    if not isinstance(idx_trace, list) or len(idx_trace) <= 0:
-                        raise RuntimeError("trace_ce requires idx_trace list in out_gen")
-
-                    assert st.stream is not None
-                    gpt = st.stream.infinity
-                    vae = st.stream.vae
-                    device0 = next(iter(gpt.parameters())).device
-                    model_dtype = next(iter(gpt.parameters())).dtype if _DEVICE == "cuda" else torch.float32
-
-                    # Disable cond-drop randomness during policy scoring.
-                    orig_cdr = float(getattr(gpt, "cond_drop_rate", 0.0) or 0.0)
-                    try:
-                        gpt.cond_drop_rate = 0.0
-                    except Exception:
-                        pass
-                    try:
-                        text_pair = getattr(st.stream, "_text_cond_tuple", None)
-                        if not (isinstance(text_pair, tuple) and len(text_pair) >= 1):
-                            raise RuntimeError("trace_ce requires stream.reset() (missing _text_cond_tuple)")
-                        text_cond_tuple = text_pair[0]
-
-                        scale_schedule = sched.scale_schedule
-                        first_full = int(_ffssi(scale_schedule))
-                        scales_in_one_clip = int(first_full) + 1
-                        clipid_target = int(step_i) + 1
-
-                        # Repetition used by rollout args (must match StageB scoring).
-                        img_rep_s = str(getattr(_infinity_args, "image_scale_repetition", "[1]")).strip()
-                        vid_rep_s = str(getattr(_infinity_args, "video_scale_repetition", "[1]")).strip()
-                        image_rep = _np.array(_json.loads(img_rep_s), dtype=_np.int64)
-                        video_rep = _np.array(_json.loads(vid_rep_s), dtype=_np.int64)
-
-                        cache_step_id: Dict[int, int] = {}
-                        step_ptr0 = 0
-                        for _si in range(len(scale_schedule)):
-                            if _si < scales_in_one_clip:
-                                _rt = int(image_rep[_si % scales_in_one_clip])
-                            else:
-                                _rt = int(video_rep[_si % scales_in_one_clip])
-                            _rt = max(1, _rt)
-                            cache_step_id[int(_si)] = int(step_ptr0 + _rt - 1)
-                            step_ptr0 += _rt
-                        if len(idx_trace) < int(step_ptr0):
-                            raise RuntimeError(f"trace_ce expects idx_trace len >= {step_ptr0}, got {len(idx_trace)}")
-
-                        # Deterministic scale selection (same as StageB trace_ce).
-                        tmax = int(float(os.environ.get("INFINITY_GRPO_TRACE_CE_TMAX", "20480")))
-                        total_tokens = int(_np.array(scale_schedule).prod(-1).sum())
-                        select_si_list = list(range(len(scale_schedule)))
-                        if total_tokens > tmax:
-                            S = int(scales_in_one_clip)
-                            L = int(len(scale_schedule))
-                            c = int(clipid_target)
-                            if L == S * 4:
-                                if c <= 1:
-                                    select_si_list = list(range(min(L, S + 11)))
-                                elif c == 2:
-                                    select_si_list = [S - 1, 2 * S - 1] + list(range(2 * S, min(L, 2 * S + 11)))
-                                else:
-                                    select_si_list = [S - 1, 2 * S - 1, 3 * S - 1] + list(range(3 * S, min(L, 3 * S + 11)))
-                            elif L == S * 3:
-                                if c <= 1:
-                                    select_si_list = list(range(min(L, S + 11)))
-                                else:
-                                    select_si_list = [S - 1, 2 * S - 1] + list(range(2 * S, min(L, 2 * S + 11)))
-                            else:
-                                select_si_list = list(range(min(L, S)))
-                                tgt = min(L - 1, c * S + (S - 1))
-                                if tgt not in select_si_list:
-                                    select_si_list.append(tgt)
-                            select_si_list = sorted({int(x) for x in select_si_list if 0 <= int(x) < L})
-                        # Keep for exact StageB replay / debugging.
-                        trace_ce_select_si_list = [int(x) for x in select_si_list]
-
-                        # Remap context refs to selected subset.
-                        scale_pack_info = sched.context_info
-                        real_si_2_new_si: Dict[int, int] = {int(r): int(i2) for i2, r in enumerate(select_si_list)}
-                        new_scale_pack_info: Dict[int, Dict[str, Any]] = {}
-                        for new_q, real_q in enumerate(select_si_list):
-                            new_scale_pack_info[int(new_q)] = {"ref_sids": []}
-                            try:
-                                refs = scale_pack_info[int(real_q)].get("ref_sids", [])
-                            except Exception:
-                                refs = []
-                            for rr in refs:
-                                nn = real_si_2_new_si.get(int(rr), None)
-                                if nn is not None:
-                                    new_scale_pack_info[int(new_q)]["ref_sids"].append(int(nn))
-
-                        apply_patchify = bool(getattr(gpt, "apply_spatial_patchify", False))
-                        if apply_patchify:
-                            vae_scale_schedule = [(int(pt), int(2 * ph), int(2 * pw)) for (pt, ph, pw) in scale_schedule]
-                        else:
-                            vae_scale_schedule = [(int(pt), int(ph), int(pw)) for (pt, ph, pw) in scale_schedule]
-
-                        def _latent_to_raw_tokens(lat: torch.Tensor) -> torch.Tensor:
-                            if apply_patchify:
-                                _x = lat.permute(0, 2, 1, 3, 4)
-                                _x = torch.nn.functional.pixel_unshuffle(_x, 2)
-                                _x = _x.permute(0, 2, 1, 3, 4)
-                            else:
-                                _x = lat
-                            return _x.reshape(_x.shape[0], _x.shape[1], -1).permute(0, 2, 1).contiguous()
-
-                        vae_embed_dim = int(getattr(gpt, "vae_embed_dim", 0) or getattr(vae, "embed_dim", 0) or 64)
-                        if getattr(_infinity_args, "noise_input", 0):
-                            summed_code = torch.randn((1, vae_embed_dim, *vae_scale_schedule[0]), device=device0, dtype=model_dtype)
-                        else:
-                            summed_code = torch.zeros((1, vae_embed_dim, *vae_scale_schedule[0]), device=device0, dtype=model_dtype)
-
-                        x_scales: List[torch.Tensor] = []
-                        gt_scales: List[torch.Tensor] = []
-                        rope_scales: List[torch.Tensor] = []
-                        dlabels: List[int] = []
-                        muls: List[int] = []
-                        clipids: List[int] = []
-
-                        for si, pn in enumerate(scale_schedule):
-                            pt, ph, pw = int(pn[0]), int(pn[1]), int(pn[2])
-                            this_lat = summed_code
-                            if tuple(this_lat.shape[-3:]) != tuple(vae_scale_schedule[int(si)]):
-                                this_lat = _F.interpolate(this_lat, size=vae_scale_schedule[int(si)], mode=vae.quantizer.z_interplote_down).contiguous()
-
-                            if int(si) in real_si_2_new_si:
-                                x_scales.append(_latent_to_raw_tokens(this_lat))
-                                rope_scales.append(
-                                    _get_rope(
-                                        gpt.rope2d_freqs_grid,
-                                        scale_schedule,
-                                        int(si),
-                                        int(cache_step_id[int(si)]),
-                                        device=device0,
-                                        args=_infinity_args,
-                                        scale_pack_info=scale_pack_info,
-                                        first_full_spatial_size_scale_index=int(first_full),
-                                    )
-                                )
-                                mul = int(pt * ph * pw)
-                                muls.append(mul)
-                                d_label = int(
-                                    getattr(gpt.other_args, "detail_scale_dim", 64)
-                                    if (ph * pw) >= int(getattr(vae.quantizer, "detail_scale_min_tokens", 350))
-                                    else getattr(gpt.other_args, "semantic_scale_dim", 16)
-                                )
-                                dlabels.append(d_label)
-                                clipids.append(int(si // max(1, scales_in_one_clip)))
-                                forced = idx_trace[int(cache_step_id[int(si)])]
-                                if not isinstance(forced, torch.Tensor):
-                                    forced = torch.tensor(forced, dtype=torch.long, device=device0)
-                                else:
-                                    forced = forced.to(device=device0, dtype=torch.long)
-                                if forced.ndim == 1:
-                                    forced = forced.unsqueeze(0)
-                                gt_scales.append(forced.reshape(1, mul, d_label).contiguous())
-
-                            # Update latent state using cached token (approx; must match StageB trace_ce).
-                            target_pn = vae_scale_schedule[int(first_full)] if int(si) < scales_in_one_clip else vae_scale_schedule[-1]
-                            forced_upd = idx_trace[int(cache_step_id[int(si)])]
-                            if not isinstance(forced_upd, torch.Tensor):
-                                forced_upd = torch.tensor(forced_upd, dtype=torch.long, device=device0)
-                            else:
-                                forced_upd = forced_upd.to(device=device0, dtype=torch.long)
-                            if forced_upd.ndim == 1:
-                                forced_upd = forced_upd.unsqueeze(0)
-                            mul = int(pt * ph * pw)
-                            d_label = int(
-                                getattr(gpt.other_args, "detail_scale_dim", 64)
-                                if (ph * pw) >= int(getattr(vae.quantizer, "detail_scale_min_tokens", 350))
-                                else getattr(gpt.other_args, "semantic_scale_dim", 16)
-                            )
-                            idx_Bld = forced_upd.reshape(1, -1)
-                            idx_Bthwd = idx_Bld.reshape(1, pt, ph, pw, d_label)
-                            if apply_patchify:
-                                _t = idx_Bthwd.permute(0, 1, 4, 2, 3)
-                                _t = torch.nn.functional.pixel_shuffle(_t, 2)
-                                idx_Bthwd = _t.permute(0, 1, 3, 4, 2)
-                            if gt_leak > 0 and isinstance(gt_ls_Bl, list) and int(si) < int(gt_leak):
-                                try:
-                                    idx_Bthwd = gt_ls_Bl[int(cache_step_id[int(si)])].to(device=device0, dtype=idx_Bthwd.dtype)
-                                except Exception:
-                                    pass
-                            if getattr(gpt.other_args, "use_two_stage_lfq", 0):
-                                if (ph * pw) >= int(getattr(vae.quantizer, "detail_scale_min_tokens", 350)):
-                                    is_sem = False
-                                    lfq = vae.quantizer.lfq_detail
-                                else:
-                                    is_sem = True
-                                    lfq = vae.quantizer.lfq_semantic
-                                codes = lfq.indices_to_codes(idx_Bthwd, "bit_label")
-                                codes = _interp(
-                                    codes,
-                                    size=(vae_embed_dim, *target_pn),
-                                    mode=vae.quantizer.z_interplote_up,
-                                    quantizer=vae.quantizer,
-                                    is_semantic_scale=is_sem,
-                                ).contiguous()
-                            else:
-                                codes = vae.quantizer.lfq_detail.indices_to_codes(idx_Bthwd, "bit_label")
-                                codes = _F.interpolate(codes, size=target_pn, mode=vae.quantizer.z_interplote_up)
-                            summed_code = _F.interpolate(summed_code, size=target_pn, mode=vae.quantizer.z_interplote_up).contiguous()
-                            summed_code = summed_code + codes
-                            if int(si) < len(scale_schedule) - 1 and tuple(scale_schedule[int(si)][-2:]) == tuple(scale_schedule[-1][-2:]):
-                                if getattr(_infinity_args, "noise_input", 0):
-                                    summed_code = torch.randn((1, summed_code.shape[1], *vae_scale_schedule[int(si) + 1]), device=device0, dtype=summed_code.dtype)
-                                else:
-                                    summed_code = torch.zeros((1, summed_code.shape[1], *vae_scale_schedule[int(si) + 1]), device=device0, dtype=summed_code.dtype)
-
-                        if not x_scales:
-                            raise RuntimeError("trace_ce selected empty scales")
-                        x_vis = torch.cat(x_scales, dim=1)
-                        rope_vis = torch.cat(rope_scales, dim=4)
-
-                        # Build querysid_refsid.
-                        # IMPORTANT: `lens` may be padded/max length depending on how `_text_cond_tuple` is cached.
-                        # For strict packing-length checks inside `gpt(...)`, we must use the *actual* per-sample
-                        # text token length, which is reliably derived from `cu_seqlens_k` / `kv_compact`.
-                        kv_compact, lens, cu_seqlens_k, max_seqlen_k = text_cond_tuple
-                        try:
-                            # B=1 in StageA server (cfg forced to 1.0 in our scripts), so take [0:1].
-                            if hasattr(cu_seqlens_k, "__len__") and len(cu_seqlens_k) >= 2:
-                                text_len0 = int(cu_seqlens_k[1].item() if hasattr(cu_seqlens_k[1], "item") else cu_seqlens_k[1]) - int(
-                                    cu_seqlens_k[0].item() if hasattr(cu_seqlens_k[0], "item") else cu_seqlens_k[0]
-                                )
-                            else:
-                                text_len0 = int(kv_compact.shape[0])
-                        except Exception:
-                            # Conservative fallback: use kv_compact length.
-                            text_len0 = int(getattr(kv_compact, "shape", [0])[0] or 0)
-                        text_len0 = int(max(0, text_len0))
-                        # Build super_scale_lengths to match Infinity forward padding:
-                        # Infinity.forward concatenates (visual + text) and then pads to pad_to_multiplier when
-                        # train_with_var_seq_len=1. build_flex_attn_func asserts:
-                        #   sum(super_scale_lengths) == padded_seq_len
-                        scale_lengths = [int(m) for m in muls] + [int(text_len0)]
-                        valid_scales = int(len(muls) + 1)
-                        try:
-                            pad_to = int(getattr(_infinity_args, "pad_to_multiplier", 128) or 128)
-                            pad_to = max(1, pad_to)
-                            cur_seq_len = int(_np.sum(scale_lengths))
-                            pad_seq_len = int(_math.ceil(cur_seq_len / float(pad_to)) * pad_to - cur_seq_len)
-                            pad_seq_len = int(max(0, pad_seq_len))
-                            if pad_seq_len > 0:
-                                scale_lengths = scale_lengths + [int(pad_seq_len)]
-                        except Exception:
-                            pass
-                        max_sid_nums = 2000
-                        qref = torch.zeros((max_sid_nums, max_sid_nums), device=device0, dtype=torch.bool)
-                        for i_sid in range(valid_scales):
-                            qref[i_sid][i_sid] = True
-                        for local_q in range(len(muls)):
-                            global_text_sid = len(muls)
-                            qref[local_q][global_text_sid] = True
-                            for local_r in new_scale_pack_info[int(local_q)]["ref_sids"]:
-                                qref[local_q][int(local_r)] = True
-
-                        with torch.cuda.amp.autocast(enabled=(_DEVICE == "cuda"), dtype=model_dtype):
-                            loss_tok, _, _ = gpt(
-                                text_cond_tuple,
-                                x_vis,
-                                gt_BL=gt_scales,
-                                is_image_batch=0,
-                                visual_rope_cache=rope_vis,
-                                sequece_packing_scales=[[tuple(map(int, scale_schedule[si])) for si in select_si_list]],
-                                super_scale_lengths=scale_lengths,
-                                super_querysid_super_refsid=qref,
-                                other_info_by_scale=None,
-                            )
-
-                        nll_target = torch.zeros((1,), dtype=loss_tok.dtype, device=loss_tok.device)
-                        tok_ptr = 0
-                        for j, mul in enumerate(muls):
-                            seg = loss_tok[tok_ptr : tok_ptr + int(mul)]
-                            tok_ptr += int(mul)
-                            if int(clipids[j]) != int(clipid_target):
-                                continue
-                            nll_target = nll_target + seg.sum() * float(dlabels[j])
-                        trace_sample_logprob_trace_ce = float((-nll_target)[0].detach().to("cpu").item())
-                    except Exception as e:
-                        # Fall back to sampling-time logprob if trace_ce fails.
-                        print(f"[trace_ce] old_logprob compute failed, fallback to sampling logprob: {e}")
-                        if strict:
-                            raise
-                        trace_sample_logprob_trace_ce = None
-                    finally:
-                        try:
-                            st.stream.infinity.cond_drop_rate = orig_cdr  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-            if trace_sample_logprob_trace_ce is not None:
-                trace_sample_logprob = float(trace_sample_logprob_trace_ce)
-            try:
-                if st.latent_dir:
-                    os.makedirs(st.latent_dir, exist_ok=True)
-                    trace_path = os.path.join(st.latent_dir, f"seg{int(step_i):02d}_trace.pt")
-                    torch.save(
-                        {
-                            "segment_index": int(step_i),
-                            "obs_len": int(obs_len),
-                            "infer_num_frames": int(infer_num_frames),
-                            "injection": str(injection),
-                            "infinity_cfg": float(cfg.infinity.cfg),
-                            "tau_list": [float(x) for x in tau_list],
-                            "top_k": int(top_k),
-                            "top_p": float(top_p),
-                            "pn": str(cfg.infinity.pn),
-                            "h_div_w_template": float(st.h_div_w_template),
-                            "dynamic_scale_schedule": str(cfg.infinity.dynamic_scale_schedule),
-                            "mask_type": str(cfg.infinity.mask_type),
-                            "scale_schedule": sched.scale_schedule,
-                            "context_info": sched.context_info,
-                            "gt_leak": int(gt_leak),
-                            "gt_ls_Bl": (
-                                [t.detach().to("cpu") for t in gt_ls_Bl]
-                                if isinstance(gt_ls_Bl, list)
-                                else None
-                            ),
-                            # Clip-id target for this segment (49f clip4 schedule: clip0=image, clip1..3=video clips).
-                            # seg00->clip1 (2..17), seg01->clip2 (18..33), seg02->clip3 (34..49).
-                            "clipid_target": int(step_i) + 1,
-                            "step_clipids": out_gen.get("step_clipids", None),
-                            "sample_logprob": float(trace_sample_logprob),
-                            "sample_logprob_sampling": float(trace_sample_logprob_sampling),
-                            "sample_logprob_trace_ce": (
-                                float(trace_sample_logprob_trace_ce)
-                                if trace_sample_logprob_trace_ce is not None
-                                else None
-                            ),
-                            "trace_ce_select_si_list": trace_ce_select_si_list if "trace_ce_select_si_list" in locals() else None,
-                            "trace_ce_total_tokens": int(total_tokens) if "total_tokens" in locals() else None,
-                            "trace_ce_tmax": int(tmax) if "tmax" in locals() else None,
-                            "sample_logprob_by_clip": out_gen.get("sample_logprob_by_clip", None),
-                            "idx_trace": out_gen.get("idx_trace", None),
-                            "image_scale_repetition": str(getattr(_infinity_args, "image_scale_repetition", "")),
-                            "video_scale_repetition": str(getattr(_infinity_args, "video_scale_repetition", "")),
-                        },
-                        trace_path,
-                    )
-            except Exception as e:
-                print(f"[trace->file] save skipped: {e}")
-                trace_path = None
+        if not isinstance(out_gen, dict):
+            raise RuntimeError("GRPO sampling requires a complete trace dict")
+        summed_codes = out_gen.get("summed_codes")
+        clipid_target = int(step_i) + 1
+        by_clip = out_gen.get("sample_logprob_by_clip")
+        token_counts = out_gen.get("token_count_by_clip")
+        if not isinstance(by_clip, (list, tuple)) or len(by_clip) <= clipid_target:
+            raise RuntimeError(f"missing policy logprob for target clip {clipid_target}")
+        if not isinstance(token_counts, (list, tuple)) or len(token_counts) <= clipid_target:
+            raise RuntimeError(f"missing policy token count for target clip {clipid_target}")
+        if int(token_counts[clipid_target]) <= 0:
+            raise RuntimeError("target clip contains no policy-sampled tokens")
+        value = by_clip[clipid_target]
+        if out_gen.get("logprob_accumulation_dtype") != "float64" or not torch.is_tensor(value) or value.dtype != torch.float64:
+            raise RuntimeError("exact clip likelihoods require FP64 accumulation and a matching sampler trace")
+        trace_sample_logprob = float(value.detach().cpu().item())
+        if not math.isfinite(trace_sample_logprob):
+            raise RuntimeError("non-finite sampling logprob")
+        mode = os.environ.get("INFINITY_STAGEA_OLD_LOGPROB_MODE", "sampling").strip().lower()
+        if mode != "sampling":
+            raise ValueError("strict GRPO requires INFINITY_STAGEA_OLD_LOGPROB_MODE=sampling; approximate trace_ce is unsupported")
+        text_condition = out_gen.get("text_cond_tuple")
+        if not isinstance(text_condition, (list, tuple)) or len(text_condition) != 4:
+            raise RuntimeError("sampler must return its exact encoded text_cond_tuple")
+        if not st.latent_dir:
+            raise RuntimeError("GRPO requires a writable trace directory")
+        os.makedirs(st.latent_dir, exist_ok=True)
+        trace_path = os.path.join(st.latent_dir, f"seg{int(step_i):02d}_trace.pt")
+        def _cpu_tree(value):
+            if torch.is_tensor(value):
+                return value.detach().to("cpu")
+            if isinstance(value, tuple):
+                return tuple(_cpu_tree(v) for v in value)
+            if isinstance(value, list):
+                return [_cpu_tree(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _cpu_tree(v) for k, v in value.items()}
+            return value
+        behavior_path = os.path.realpath(cfg.infinity.ckpt)
+        behavior_stat = os.stat(behavior_path)
+        trace = {
+            "schema_version": 3,
+            "logprob_accumulation_dtype": "float64",
+            "old_logprob_mode": "sampling",
+            "behavior_checkpoint": behavior_path,
+            "behavior_checkpoint_size": int(behavior_stat.st_size),
+            "behavior_checkpoint_mtime_ns": int(behavior_stat.st_mtime_ns),
+            "block_parameter_dtype": str(next(st.stream.infinity.unregistered_blocks[0].parameters()).dtype),
+            "autocast_dtype": "torch.bfloat16",
+            "amp_dtype": "torch.bfloat16",
+            "prompt_infer": prompt_infer,
+            "negative_prompt": str(st.negative_prompt or ""),
+            "text_cond_tuple": text_condition,
+            "negative_text_cond_tuple": out_gen.get("negative_text_cond_tuple"),
+            "segment_index": int(step_i),
+            "obs_len": int(obs_len),
+            "infer_num_frames": int(infer_num_frames),
+            "injection": str(injection),
+            "infinity_cfg": float(cfg.infinity.cfg),
+            "tau_list": [float(x) for x in tau_list],
+            "top_k": int(top_k), "top_p": float(top_p),
+            "pn": str(cfg.infinity.pn),
+            "h_div_w_template": float(st.h_div_w_template),
+            "dynamic_scale_schedule": str(cfg.infinity.dynamic_scale_schedule),
+            "mask_type": str(cfg.infinity.mask_type),
+            "scale_schedule": sched.scale_schedule,
+            "context_info": sched.context_info,
+            "gt_leak": int(gt_leak), "gt_ls_Bl": gt_ls_Bl,
+            "clipid_target": clipid_target,
+            "step_clipids": out_gen.get("step_clipids"),
+            "step_is_sampled": out_gen.get("step_is_sampled"),
+            "sample_logprob": trace_sample_logprob,
+            "sample_logprob_sampling": trace_sample_logprob,
+            "sample_logprob_by_clip": by_clip,
+            "sample_token_count_by_clip": token_counts,
+            "idx_trace": out_gen.get("idx_trace"),
+            "chosen_token_logprobs": out_gen.get("chosen_token_logprobs"),
+            "image_scale_repetition": str(_infinity_args.image_scale_repetition),
+            "video_scale_repetition": str(_infinity_args.video_scale_repetition),
+        }
+        for key in ("max_repeat_times", "noise_input", "semantic_scales", "use_cfg", "use_apg", "apg_norm_threshold", "frames_inner_clip", "rope2d_normalized_by_hw", "rope2d_each_sa_layer", "rope_type", "semantic_scale_dim", "detail_scale_dim", "detail_scale_min_tokens", "use_two_stage_lfq"):
+            if hasattr(_infinity_args, key):
+                trace[key] = getattr(_infinity_args, key)
+        torch.save(_cpu_tree(trace), trace_path)
         if not isinstance(summed_codes, torch.Tensor):
             raise RuntimeError(f"Unexpected Infinity output type: {type(out_gen)}")
 
@@ -1944,9 +1650,9 @@ def _actionhead_ref_predict_actions_cm_deg(
         tx, ty, tz = [float(x) for x in deltas[i, 3:6]]
         out_actions.append(
             [
-                tx * 100.0,
-                ty * 100.0,
-                tz * 100.0,
+                tx * float(_ah_stats["translation_divisor"]),
+                ty * float(_ah_stats["translation_divisor"]),
+                tz * float(_ah_stats["translation_divisor"]),
                 dx * (180.0 / math.pi),  # roll (x)
                 dz * (180.0 / math.pi),  # yaw (z)
                 dy * (180.0 / math.pi),  # pitch (y)

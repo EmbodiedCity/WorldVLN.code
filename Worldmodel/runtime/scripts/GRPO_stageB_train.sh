@@ -72,8 +72,8 @@ EXTRA_EPOCHS="${EXTRA_EPOCHS:-1}"
 IMAGE_SCALE_REPETITION="${IMAGE_SCALE_REPETITION:-[3,3,3,3,3,3,3,3,3,3,3,3,3,3]}"
 VIDEO_SCALE_REPETITION="${VIDEO_SCALE_REPETITION:-[3,3,3,3,3,3,3,3,3,3,3,3,2,1]}"
 # Align with proven finetune settings by default (override via env if needed).
-SHORT_CAP_PROB="${SHORT_CAP_PROB:-0.3}"
-ENABLE_DYNAMIC_LENGTH_PROMPT="${ENABLE_DYNAMIC_LENGTH_PROMPT:-1}"
+SHORT_CAP_PROB="${SHORT_CAP_PROB:-0.0}"
+ENABLE_DYNAMIC_LENGTH_PROMPT="${ENABLE_DYNAMIC_LENGTH_PROMPT:-0}"
 REWEIGHT_LOSS_BY_SCALE="${REWEIGHT_LOSS_BY_SCALE:-4}"
 CONTEXT_FROM_LARGEST_NO="${CONTEXT_FROM_LARGEST_NO:-0}"
 APPEND_DURATION2CAPTION="${APPEND_DURATION2CAPTION:-1}"
@@ -90,14 +90,22 @@ GRPO_AUX_SFT_COEF="${GRPO_AUX_SFT_COEF:-0.0}"              # add coef * SFT loss
 GRPO_LAMBDA_ACT="${GRPO_LAMBDA_ACT:-1.0}"                  # weight for act-adv reward level
 GRPO_LAMBDA_TASK="${GRPO_LAMBDA_TASK:-1.0}"                # weight for task-adv reward level
 GRPO_LAMBDA_CE="${GRPO_LAMBDA_CE:-1.0}"                    # weight for CE-adv reward level (zscore-exp)
-GRPO_KL_BETA="${GRPO_KL_BETA:-0.1}"                        # recommended start: 0.1 (see INFINITY_CLIP_GRPO_FEASIBILITY_CN.md)
+GRPO_KL_BETA="${GRPO_KL_BETA:-0.0}"                        # exact replay: nonzero KL requires an explicit per-token reference implementation
 GRPO_NEW_LOGPROB_MODE="${GRPO_NEW_LOGPROB_MODE:-trace_replay}"  # trace_replay | trace_ce | proxy_ce
+GRPO_BLOCK_DTYPE="${GRPO_BLOCK_DTYPE:-float32}"
+GRPO_FSDP_COMPUTE_DTYPE="${GRPO_FSDP_COMPUTE_DTYPE:-none}"
+GRPO_FSDP_CPU_OFFLOAD="${GRPO_FSDP_CPU_OFFLOAD:-0}"
+GRPO_CHUNK_GRADIENT_DIAGNOSTICS="${GRPO_CHUNK_GRADIENT_DIAGNOSTICS:-0}"
+if [ "${TRAINER_TYPE,,}" = "grpo" ] && [ "${GRPO_NEW_LOGPROB_MODE}" != "trace_replay" ]; then
+  echo "[FATAL] GRPO requires exact trace_replay; approximate trace_ce/proxy_ce scoring is unsupported."
+  exit 1
+fi
 GRPO_REQUIRE_NONNEGATIVE_ADV="${GRPO_REQUIRE_NONNEGATIVE_ADV:-1}"
 GRPO_LOG_WEIGHT_STATS="${GRPO_LOG_WEIGHT_STATS:-1}"
 # PPO/GRPO safety knobs (configurable via env).
 GRPO_ADV_CLIP="${GRPO_ADV_CLIP:-10.0}"                     # clip per-sample advantage magnitude
 GRPO_RATIO_EPS="${GRPO_RATIO_EPS:-0.2}"                    # PPO ratio clip epsilon
-# Default: prefer replay activation checkpointing; avoid CPU offload (can trigger host OOM/SIGKILL).
+# Optional selective activation offload; parameter views stay under FSDP lifecycle.
 GRPO_REPLAY_SAVE_ON_CPU="${GRPO_REPLAY_SAVE_ON_CPU:-0}"
 # Pinned CPU memory can trigger host OOM / SIGKILL under multi-proc + replay; default off for stability.
 GRPO_REPLAY_SAVE_ON_CPU_PIN="${GRPO_REPLAY_SAVE_ON_CPU_PIN:-0}"
@@ -171,7 +179,7 @@ if [ ! -f "${VAE_PATH}" ]; then
   echo "Set env VAE_PATH to a valid infinitystar_videovae.pth."
   exit 1
 fi
-if [ ! -d "${TORCHSHARD_RESUME_PATH}" ]; then
+if [ -z "${RUSH_RESUME}" ] && [ ! -d "${TORCHSHARD_RESUME_PATH}" ]; then
   echo "Missing TORCHSHARD_RESUME_PATH directory: ${TORCHSHARD_RESUME_PATH}"
   echo "Set env TORCHSHARD_RESUME_PATH to a valid Infinity torchshard folder."
   exit 1
@@ -335,13 +343,11 @@ if [ "${iters_train_est}" -gt 0 ] && [ "${resume_g_it_bed}" -ge 0 ]; then
   fi
 fi
 
-TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE}")
+TORCHRUN_ARGS=(--nproc_per_node="${NPROC_PER_NODE}" --master_addr="${MASTER_ADDR}" --master_port="${MASTER_PORT}")
 if [ "${NNODES}" -gt 1 ]; then
   TORCHRUN_ARGS+=(
     --nnodes="${NNODES}"
     --node_rank="${NODE_RANK}"
-    --master_addr="${MASTER_ADDR}"
-    --master_port="${MASTER_PORT}"
   )
 fi
 
@@ -410,6 +416,10 @@ echo "[stageB] run_id=${RUN_ID:-latest} nnodes=${NNODES} node_rank=${NODE_RANK} 
   --grpo_alpha_decay 0.9 \
   --grpo_require_old_logprob "${GRPO_REQUIRE_OLD_LOGPROB}" \
   --grpo_new_logprob_mode "${GRPO_NEW_LOGPROB_MODE}" \
+  --grpo_block_dtype "${GRPO_BLOCK_DTYPE}" \
+  --grpo_fsdp_compute_dtype "${GRPO_FSDP_COMPUTE_DTYPE}" \
+  --grpo_fsdp_cpu_offload "${GRPO_FSDP_CPU_OFFLOAD}" \
+  --grpo_chunk_gradient_diagnostics "${GRPO_CHUNK_GRADIENT_DIAGNOSTICS}" \
   --grpo_require_nonnegative_adv "${GRPO_REQUIRE_NONNEGATIVE_ADV}" \
   --grpo_log_weight_stats "${GRPO_LOG_WEIGHT_STATS}" \
   --grpo_replay_save_on_cpu "${GRPO_REPLAY_SAVE_ON_CPU}" \

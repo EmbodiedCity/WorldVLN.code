@@ -6,6 +6,7 @@ Definition of Infinity transformer model.
 """
 
 import math
+import os
 import random
 import time
 from contextlib import nullcontext
@@ -35,6 +36,56 @@ try:
     from infinity.models.fused_op import fused_ada_layer_norm, fused_ada_rms_norm
 except:
     fused_ada_layer_norm, fused_ada_rms_norm = None, None
+
+
+
+def _policy_trace_layout(scale_schedule, scales_per_clip, image_repetitions, video_repetitions, max_repeat_times):
+    if int(scales_per_clip) <= 0 or len(scale_schedule) % int(scales_per_clip):
+        raise ValueError("Policy schedule must contain complete clips")
+    if len(image_repetitions) != scales_per_clip or len(video_repetitions) != scales_per_clip:
+        raise ValueError("Policy repetition arrays must match scales per clip")
+    if int(max_repeat_times) < 1:
+        raise ValueError("Policy max_repeat_times must be positive")
+    counts, clipids = [], []
+    for si in range(len(scale_schedule)):
+        raw = (image_repetitions if si < scales_per_clip else video_repetitions)[si % scales_per_clip]
+        if int(raw) != raw or int(raw) < 1:
+            raise ValueError("Policy repetition counts must be positive integers")
+        count = min(int(raw), int(max_repeat_times))
+        counts.append(count)
+        clipids.extend([si // scales_per_clip] * count)
+    return counts, clipids
+
+
+def _policy_log_probs(logits, top_k=0, top_p=0.0):
+    """The normalized sampling law, also used by differentiable forced replay."""
+    logits = logits.float()
+    if not bool(torch.isfinite(logits).all()):
+        raise ValueError("Policy logits must be finite")
+    if int(top_k) < 0 or not math.isfinite(float(top_p)) or not 0.0 <= float(top_p) <= 1.0:
+        raise ValueError("Invalid top-k/top-p policy configuration")
+    if 0 < int(top_k) < logits.shape[-1]:
+        cutoff = torch.topk(logits, int(top_k), dim=-1).values[..., -1:]
+        logits = logits.masked_fill(logits < cutoff, float("-inf"))
+    if 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        remove = sorted_logits.softmax(-1).cumsum(-1) > float(top_p)
+        remove = torch.cat((torch.zeros_like(remove[..., :1]), remove[..., :-1]), dim=-1)
+        remove = torch.zeros_like(remove).scatter(-1, sorted_indices, remove)
+        logits = logits.masked_fill(remove, float("-inf"))
+    return logits.log_softmax(dim=-1)
+
+
+def _policy_checked_tokens(tokens, expected_shape, vocab_size, device, description):
+    tokens = torch.as_tensor(tokens, device=device)
+    if tokens.dtype == torch.bool or tokens.is_floating_point() or tokens.is_complex():
+        raise ValueError(f"{description} must contain integer token indices")
+    if tokens.numel() != int(expected_shape[0]) * int(expected_shape[1]):
+        raise ValueError(f"{description} has {tokens.numel()} bits; expected shape {tuple(expected_shape)}")
+    tokens = tokens.to(dtype=torch.long).reshape(*expected_shape)
+    if bool(((tokens < 0) | (tokens >= int(vocab_size))).any()):
+        raise ValueError(f"{description} contains an out-of-vocabulary token")
+    return tokens
 
 
 class MultiInpIdentity(nn.Module):
@@ -365,13 +416,14 @@ class Infinity(nn.Module):
         visual_tokens = x_BLC[:,:visual_tokens_len]
         return visual_tokens
     
-    def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC: torch.Tensor,
+    def forward(self, label_B_or_BLT: Union[torch.LongTensor, Tuple[torch.FloatTensor, torch.IntTensor, int]], x_BLC: Optional[torch.Tensor] = None,
         visual_rope_cache = None,
         sequece_packing_scales = None, # [[(1,1,1)->(5,5,5)], [(1,1,1)->(10,10,10)]] 1LC
         super_scale_lengths = None,
         super_querysid_super_refsid = None,
         other_info_by_scale = None,
         gt_BL = None,
+        policy_trace_replay_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:  # returns logits_BLV
         """
@@ -379,6 +431,15 @@ class Infinity(nn.Module):
         :return: logits BLV, V is vocab_size
         """
         
+        if policy_trace_replay_kwargs is not None:
+            replay_kwargs = dict(policy_trace_replay_kwargs)
+            if "label_B_or_BLT" in replay_kwargs:
+                raise ValueError("Pass replay text conditions as the normal forward argument")
+            return self.ar_infer_infinity_elegant_replay_logprob(
+                label_B_or_BLT=label_B_or_BLT, **replay_kwargs
+            )
+        if x_BLC is None:
+            raise ValueError("SFT forward requires visual inputs")
         x_BLC= x_BLC.float()       # input should be float32
         B = x_BLC.shape[0]
         cond_BD_or_gss, ca_kv = None, None
@@ -559,6 +620,16 @@ class Infinity(nn.Module):
     
     @torch.no_grad()
     def ar_infer_infinity_elegant(
+        self, *infer_args, return_trace: bool = False, forced_idx_trace=None,
+        return_logprob_by_clip: bool = False, **kwargs,
+    ):
+        """Sample the same guided/tempered policy that strict replay scores."""
+        return self._ar_infer_infinity_elegant_impl(
+            *infer_args, return_trace=return_trace, forced_idx_trace=forced_idx_trace,
+            return_logprob_by_clip=return_logprob_by_clip, **kwargs,
+        )
+
+    def _ar_infer_infinity_elegant_impl(
         self,
         vae=None,
         scale_schedule=None,
@@ -572,18 +643,42 @@ class Infinity(nn.Module):
         get_visual_rope_embeds=None,
         context_info=None,
         return_summed_code_only=False,
+        return_trace: bool = False,
+        forced_idx_trace: Optional[List[Any]] = None,
+        # Optional: return per-clip logprob sums (clip0=image, clip1..=video clips).
+        return_logprob_by_clip: bool = False,
         kv_cache_reset: bool = True,
         skip_text_forward: bool = False,
         cache_text_as_gt: bool = False,
         extra_ref_text_scale_inds: Optional[List[Union[int, str]]] = None,
+        logprob_only: bool = False,
+        logprob_clipid_target: Optional[int] = None,
+        expected_step_clipids=None,
+        expected_step_is_sampled=None,
+        expected_token_count: Optional[int] = None,
         **kwargs,
     ):   # returns List[idx_Bl]
         from infinity.schedules.infinity_elegant import interpolate
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
-        assert len(cfg_list) >= len(scale_schedule)
-        assert len(tau_list) >= len(scale_schedule)
-        assert args.use_cfg + args.use_apg == 1
+        if not scale_schedule or args is None or label_B_or_BLT is None or get_visual_rope_embeds is None:
+            raise ValueError("AR policy requires schedule, args, text conditions and visual RoPE")
+        if int(B) != 1:
+            raise ValueError("AR policy trace currently requires B=1")
+        if len(cfg_list) != len(scale_schedule) or len(tau_list) != len(scale_schedule):
+            raise ValueError("CFG and temperature must be recorded for every scale")
+        if not all(math.isfinite(float(v)) for v in cfg_list):
+            raise ValueError("CFG must be finite")
+        if not all(math.isfinite(float(v)) and float(v) > 0 for v in tau_list):
+            raise ValueError("Temperature must be finite and positive")
+        if int(top_k) < 0 or not math.isfinite(float(top_p)) or not 0.0 <= float(top_p) <= 1.0:
+            raise ValueError("Invalid top-k/top-p policy configuration")
+        if int(args.use_cfg) + int(args.use_apg) != 1:
+            raise ValueError("Exactly one of CFG and APG must be enabled")
+        if (return_trace or logprob_only) and bool(self.other_args.noise_input):
+            raise ValueError("Strict policy traces require noise_input=0; latent noise is not recorded")
+        if logprob_only and (forced_idx_trace is None or not kv_cache_reset or skip_text_forward):
+            raise ValueError("Strict replay requires a complete forced trace and a fresh text/KV prefix")
         device = label_B_or_BLT[0].device
         if self.apply_spatial_patchify:
             vae_scale_schedule = [(pt, 2*ph, 2*pw) for pt, ph, pw in scale_schedule]
@@ -596,134 +691,281 @@ class Infinity(nn.Module):
         bs = prefix_tokens.shape[0]
         ca_kv, cond_BD_or_gss, attn_mask = None, None, None
         ret, idx_Bl_list = [], []  # current length, list of reconstructed images
-        for b in self.unregistered_blocks: b.attn.kv_caching(True, reset=kv_cache_reset)
+        trace_tokens: List[torch.Tensor] = []
+        # A clip contains millions of bits: FP32 totals near -1e6 lose log-ratio
+        # changes smaller than one ULP. Keep the sampling law in FP32, but sum
+        # selected logprobs and accumulate across scales in FP64 on both paths.
+        sample_logprob = torch.zeros((B,), dtype=torch.float64, device=prefix_tokens.device)
+        sample_logprob_by_clip: Optional[List[torch.Tensor]] = None
+        step_clipids: Optional[List[int]] = [] if (return_trace or return_logprob_by_clip) else None
+        trace_step_ptr = 0
         first_full_spatial_size_scale_index = get_first_full_spatial_size_scale_index(scale_schedule)
         image_scale_repetition = np.array(json.loads(args.image_scale_repetition))
         video_scale_repetition = np.array(json.loads(args.video_scale_repetition))
         scales_in_one_clip = first_full_spatial_size_scale_index + 1
         assert len(image_scale_repetition) == len(video_scale_repetition), f'{len(image_scale_repetition)} != {len(video_scale_repetition)}'
         assert len(image_scale_repetition) == scales_in_one_clip, f'{len(image_scale_repetition)} != {scales_in_one_clip}'
-        total_steps = image_scale_repetition.sum() + video_scale_repetition.sum() * (len(scale_schedule)//len(video_scale_repetition)-1)
+        repeat_counts, planned_clipids = _policy_trace_layout(
+            scale_schedule, scales_in_one_clip, image_scale_repetition, video_scale_repetition, args.max_repeat_times
+        )
+        planned_sampled = [si >= int(gt_leak) for si, count in enumerate(repeat_counts) for _ in range(count)]
+        n_clips = len(scale_schedule) // scales_in_one_clip
+        if forced_idx_trace is not None and len(forced_idx_trace) != len(planned_clipids):
+            raise ValueError(f"Trace has {len(forced_idx_trace)} steps; schedule requires {len(planned_clipids)}")
+        if expected_step_clipids is not None and list(expected_step_clipids) != planned_clipids:
+            raise ValueError("Trace clip mapping does not match scale/repetition schedule")
+        if expected_step_is_sampled is not None and list(expected_step_is_sampled) != planned_sampled:
+            raise ValueError("Trace sampled/GT mask does not match gt_leak")
+        if int(gt_leak) > 0 and gt_ls_Bl is None:
+            raise ValueError("GT prefix tokens are required when gt_leak > 0")
+        target_clip = None if logprob_clipid_target is None else int(logprob_clipid_target)
+        if target_clip is not None and not 0 <= target_clip < n_clips:
+            raise ValueError(f"Target clip {target_clip} is outside [0, {n_clips})")
+        end_scale = len(scale_schedule) - 1 if target_clip is None else (target_clip + 1) * scales_in_one_clip - 1
+        token_count_by_clip = [0] * n_clips
+        trace_is_sampled = []
+        total_steps = sum(repeat_counts)
         if not skip_text_forward:
             total_steps += 1  # prefix text token forward step
         pbar = tqdm.tqdm(total=total_steps)
         block_chunks = self.block_chunks if self.num_block_chunks > 1 else self.blocks
 
-        noise_shape = vae_scale_schedule[0]
-        if self.other_args.noise_input:
-            noise = torch.randn((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
-        else:
-            noise = torch.zeros((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
-        
-        summed_codes = [noise[0:1]]
-        sos_token = self.embeds_codes2input(noise, bs//1)
-        # text tokens forward (optional, useful for caching prefix as GT)
-        if not skip_text_forward:
-            if cache_text_as_gt:
-                self.set_cache_write_is_pred(False)
-            rope_cache = self.rope2d_freqs_grid['freqs_text'][:,:,:,:,:text_maxlen_this_iter]
-            last_stage = prefix_tokens
-            pbar.update(1)
-            for block_idx, b in enumerate(block_chunks):
-                last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind='t0', context_info=context_info, last_repetition_step=True)
-            if cache_text_as_gt:
-                self.set_cache_write_is_pred(True)
-
-        # visual tokens forward
-        ref_text_scale_inds = ['t0']
-        if extra_ref_text_scale_inds:
-            ref_text_scale_inds.extend(extra_ref_text_scale_inds)
-        last_stage = sos_token
-        cum_scales = 0
-        for si, pn in enumerate(scale_schedule):   # si: i-th segment
-            rel_si_in_one_clip = si % scales_in_one_clip
-            if si < scales_in_one_clip: # image
-                repeat_times = image_scale_repetition[si%scales_in_one_clip]
-                target_pn = vae_scale_schedule[first_full_spatial_size_scale_index]
+        for block in self.unregistered_blocks:
+            block.attn.kv_caching(True, reset=kv_cache_reset)
+        try:
+            noise_shape = vae_scale_schedule[0]
+            if self.other_args.noise_input:
+                noise = torch.randn((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
             else:
-                repeat_times = video_scale_repetition[si%scales_in_one_clip]
-                target_pn = vae_scale_schedule[-1]
-            cfg = cfg_list[si]
-            infer_repeat_times = min(repeat_times, args.max_repeat_times)
-            for repeat_idx in range(infer_repeat_times):
-                # print(f'real scale ind is : {cum_scales+repeat_idx}')
-                rope_cache = get_visual_rope_embeds(self.rope2d_freqs_grid, scale_schedule, si, cum_scales+repeat_idx, device, args, context_info, first_full_spatial_size_scale_index)
+                noise = torch.zeros((1, self.vae_embed_dim, *noise_shape), dtype=prefix_tokens.dtype, device=prefix_tokens.device)
+        
+            summed_codes = [noise[0:1]]
+            sos_token = self.embeds_codes2input(noise, bs//1)
+            # text tokens forward (optional, useful for caching prefix as GT)
+            if not skip_text_forward:
+                if cache_text_as_gt:
+                    self.set_cache_write_is_pred(False)
+                rope_cache = self.rope2d_freqs_grid['freqs_text'][:,:,:,:,:text_maxlen_this_iter]
+                last_stage = prefix_tokens
                 pbar.update(1)
-                last_repetition_step = (repeat_idx == (infer_repeat_times-1))
                 for block_idx, b in enumerate(block_chunks):
-                    last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step, ref_text_scale_inds=ref_text_scale_inds)
-                logits_BlV = self.get_logits_during_infer(last_stage, is_semantic_scale=rel_si_in_one_clip < args.semantic_scales).mul(1/tau_list[si])
-                if cfg != 1:
-                    # print(f'add cfg on add_cfg_on_logits')
-                    if args.use_cfg:
-                        logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
-                    elif args.use_apg:
-                        pred_cond = logits_BlV[:B]
-                        pred_uncond = logits_BlV[B:]
-                        pred_guided = normalized_guidance(pred_cond, pred_uncond, guidance_scale=cfg, momentum_buffer=None, eta=0, norm_threshold=args.apg_norm_threshold)
-                        # pred_guided = cfg * pred_cond + (1-cfg) * pred_uncond
-                        logits_BlV = pred_guided
+                    last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind='t0', context_info=context_info, last_repetition_step=True)
+                if cache_text_as_gt:
+                    self.set_cache_write_is_pred(True)
+
+            # visual tokens forward
+            ref_text_scale_inds = ['t0']
+            if extra_ref_text_scale_inds:
+                ref_text_scale_inds.extend(extra_ref_text_scale_inds)
+            last_stage = sos_token
+            cum_scales = 0
+            if return_logprob_by_clip or return_trace or logprob_only:
+                # number of clips is an integer multiple of scales_in_one_clip by construction
+                n_clips = max(1, int(len(scale_schedule) // max(1, scales_in_one_clip)))
+                sample_logprob_by_clip = [torch.zeros_like(sample_logprob) for _ in range(n_clips)]
+            for si, pn in enumerate(scale_schedule):   # si: i-th segment
+                rel_si_in_one_clip = si % scales_in_one_clip
+                clipid = int(si // max(1, scales_in_one_clip))
+                if si < scales_in_one_clip: # image
+                    repeat_times = image_scale_repetition[si%scales_in_one_clip]
+                    target_pn = vae_scale_schedule[first_full_spatial_size_scale_index]
                 else:
-                    logits_BlV = logits_BlV[:B]
+                    repeat_times = video_scale_repetition[si%scales_in_one_clip]
+                    target_pn = vae_scale_schedule[-1]
+                cfg = cfg_list[si]
+                infer_repeat_times = repeat_counts[si]
+                for repeat_idx in range(infer_repeat_times):
+                    # print(f'real scale ind is : {cum_scales+repeat_idx}')
+                    rope_cache = get_visual_rope_embeds(self.rope2d_freqs_grid, scale_schedule, si, cum_scales+repeat_idx, device, args, context_info, first_full_spatial_size_scale_index)
+                    pbar.update(1)
+                    last_repetition_step = (repeat_idx == (infer_repeat_times-1))
+                    for block_idx, b in enumerate(block_chunks):
+                        last_stage = b(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=attn_mask, attn_fn=None, scale_schedule=scale_schedule, rope2d_freqs_grid=rope_cache, scale_ind=si, context_info=context_info, last_repetition_step=last_repetition_step, ref_text_scale_inds=ref_text_scale_inds)
+                    logits_BlV = self.get_logits_during_infer(last_stage, is_semantic_scale=rel_si_in_one_clip < args.semantic_scales).mul(1/tau_list[si])
+                    if cfg != 1:
+                        # print(f'add cfg on add_cfg_on_logits')
+                        if args.use_cfg:
+                            logits_BlV = cfg * logits_BlV[:B] + (1-cfg) * logits_BlV[B:]
+                        elif args.use_apg:
+                            pred_cond = logits_BlV[:B]
+                            pred_uncond = logits_BlV[B:]
+                            pred_guided = normalized_guidance(pred_cond, pred_uncond, guidance_scale=cfg, momentum_buffer=None, eta=0, norm_threshold=args.apg_norm_threshold)
+                            # pred_guided = cfg * pred_cond + (1-cfg) * pred_uncond
+                            logits_BlV = pred_guided
+                    else:
+                        logits_BlV = logits_BlV[:B]
                 
-                tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
-                logits_BlV = logits_BlV.reshape(tmp_bs, -1, self.num_of_label_value)
-                probs_Bld = logits_BlV.softmax(dim=-1) # [B, thwd or thw4d, 2]
-                idx_Bld = torch.multinomial(probs_Bld.view(-1, self.num_of_label_value), num_samples=1, replacement=True, generator=rng).view(tmp_bs, -1) # [B, thwd or thw4d]
-                probs_Bld = torch.gather(probs_Bld, dim=2, index=idx_Bld.unsqueeze(-1)).squeeze(-1)
-
-                def Bld2Bthwd(item):
-                    item = item.reshape(tmp_bs, tmp_seq_len, -1) # [B, thw, d or 4d]
-                    item = item.reshape(B, pn[0], pn[1], pn[2], -1) # shape: [B, t, h, w, d] or [B, t, h, w, 4d]
-                    if self.apply_spatial_patchify: # unpatchify operation
-                        item = item.permute(0,1,4,2,3) # [B, t, 4d, h, w]
-                        item = torch.nn.functional.pixel_shuffle(item, 2) # [B, t, d, 2h, 2w]
-                        item = item.permute(0,1,3,4,2) # [B, t, 2h, 2w, d]
-                    return item
-
-                idx_Bld = Bld2Bthwd(idx_Bld)
-                probs_Bld = Bld2Bthwd(probs_Bld)
-                # print(f'{si=} {repeat_idx=} idx_Bld.shape={idx_Bld.shape}')
-
-                if si < gt_leak:
-                    idx_Bld = gt_ls_Bl[cum_scales+repeat_idx]
-                # idx_Bld [B, t, h, w, d] or [B, t, 2h, 2w, d]
-                if self.other_args.use_two_stage_lfq:
-                    if pn[1] * pn[2] >= vae.quantizer.detail_scale_min_tokens:
-                        is_semantic_scale = False
-                        lfq = vae.quantizer.lfq_detail
+                    tmp_bs, tmp_seq_len = logits_BlV.shape[:2]
+                    logits_BlV = logits_BlV.reshape(tmp_bs, -1, self.num_of_label_value)
+                    log_probs_Bld = _policy_log_probs(logits_BlV, top_k=top_k, top_p=top_p)
+                    sampled_step = si >= int(gt_leak)
+                    if forced_idx_trace is not None:
+                        idx_Bld = _policy_checked_tokens(
+                            forced_idx_trace[trace_step_ptr], log_probs_Bld.shape[:2], self.num_of_label_value,
+                            log_probs_Bld.device, f"trace step {trace_step_ptr}",
+                        )
+                    elif sampled_step:
+                        idx_Bld = torch.multinomial(
+                            log_probs_Bld.exp().reshape(-1, self.num_of_label_value), num_samples=1,
+                            replacement=True, generator=rng,
+                        ).view(tmp_bs, -1)
                     else:
-                        is_semantic_scale = True
-                        lfq = vae.quantizer.lfq_semantic
-                    codes = lfq.indices_to_codes(idx_Bld, 'bit_label')
-                    codes = interpolate(codes, size=(self.vae_embed_dim, *target_pn), mode=vae.quantizer.z_interplote_up, quantizer=vae.quantizer, is_semantic_scale=is_semantic_scale).contiguous()
-                else:
-                    codes = vae.quantizer.lfq_detail.indices_to_codes(idx_Bld, 'bit_label')
-                    codes = F.interpolate(codes, size=target_pn, mode=vae.quantizer.z_interplote_up)
-                summed_codes[-1] = F.interpolate(summed_codes[-1], size=target_pn, mode=vae.quantizer.z_interplote_up)
-                summed_codes[-1] += codes
-                if repeat_idx < repeat_times - 1:
-                    last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si], mode=vae.quantizer.z_interplote_down)
+                        idx_Bld = None
+                    if not sampled_step:
+                        gt_tokens = gt_ls_Bl[cum_scales + repeat_idx]
+                        if self.apply_spatial_patchify:
+                            # Encoder GT is in VAE spatial order; invert the decoder's pixel shuffle
+                            # before treating its bits as autoregressive patchified token labels.
+                            gt_tokens = torch.as_tensor(gt_tokens, device=log_probs_Bld.device)
+                            if gt_tokens.ndim != 5:
+                                raise ValueError("Patchified GT prefix requires [B,T,2H,2W,D] bit labels")
+                            gt_tokens = F.pixel_unshuffle(gt_tokens.permute(0, 1, 4, 2, 3), 2).permute(0, 1, 3, 4, 2)
+                        gt_step = _policy_checked_tokens(
+                            gt_tokens, log_probs_Bld.shape[:2], self.num_of_label_value,
+                            log_probs_Bld.device, f"GT scale {si} repeat {repeat_idx}",
+                        )
+                        if idx_Bld is not None and not torch.equal(idx_Bld, gt_step):
+                            raise ValueError(f"Trace differs from the deterministic GT prefix at step {trace_step_ptr}")
+                        idx_Bld = gt_step
+                    taken_logprobs = torch.gather(log_probs_Bld, 2, idx_Bld.unsqueeze(-1)).squeeze(-1)
+                    if sampled_step:
+                        if not bool(torch.isfinite(taken_logprobs).all()):
+                            raise ValueError(f"Trace token has zero probability at step {trace_step_ptr}")
+                        step_lp = taken_logprobs.sum(dim=1, dtype=torch.float64)
+                        token_count_by_clip[clipid] += int(idx_Bld.numel() // B)
+                    else:
+                        # Leaked prefix bits are deterministic conditions, not policy actions.
+                        step_lp = torch.zeros_like(sample_logprob)
+                    probs_Bld = taken_logprobs.exp()
+                    sample_logprob = sample_logprob + step_lp
+                    if sample_logprob_by_clip is not None:
+                        sample_logprob_by_clip[clipid] = sample_logprob_by_clip[clipid] + step_lp
+                    trace_is_sampled.append(bool(sampled_step))
+                    if return_trace:
+                        trace_tokens.append(idx_Bld.detach().to("cpu"))
+                    if step_clipids is not None:
+                        step_clipids.append(int(clipid))
+                    trace_step_ptr += 1
+
+                    def Bld2Bthwd(item):
+                        item = item.reshape(tmp_bs, tmp_seq_len, -1) # [B, thw, d or 4d]
+                        item = item.reshape(B, pn[0], pn[1], pn[2], -1) # shape: [B, t, h, w, d] or [B, t, h, w, 4d]
+                        if self.apply_spatial_patchify: # unpatchify operation
+                            item = item.permute(0,1,4,2,3) # [B, t, 4d, h, w]
+                            item = torch.nn.functional.pixel_shuffle(item, 2) # [B, t, d, 2h, 2w]
+                            item = item.permute(0,1,3,4,2) # [B, t, 2h, 2w, d]
+                        return item
+
+                    idx_Bld = Bld2Bthwd(idx_Bld)
+                    probs_Bld = Bld2Bthwd(probs_Bld)
+                    # print(f'{si=} {repeat_idx=} idx_Bld.shape={idx_Bld.shape}')
+                    # idx_Bld [B, t, h, w, d] or [B, t, 2h, 2w, d]
+                    if self.other_args.use_two_stage_lfq:
+                        if pn[1] * pn[2] >= vae.quantizer.detail_scale_min_tokens:
+                            is_semantic_scale = False
+                            lfq = vae.quantizer.lfq_detail
+                        else:
+                            is_semantic_scale = True
+                            lfq = vae.quantizer.lfq_semantic
+                        codes = lfq.indices_to_codes(idx_Bld, 'bit_label')
+                        codes = interpolate(codes, size=(self.vae_embed_dim, *target_pn), mode=vae.quantizer.z_interplote_up, quantizer=vae.quantizer, is_semantic_scale=is_semantic_scale).contiguous()
+                    else:
+                        codes = vae.quantizer.lfq_detail.indices_to_codes(idx_Bld, 'bit_label')
+                        codes = F.interpolate(codes, size=target_pn, mode=vae.quantizer.z_interplote_up)
+                    summed_codes[-1] = F.interpolate(summed_codes[-1], size=target_pn, mode=vae.quantizer.z_interplote_up)
+                    summed_codes[-1] = summed_codes[-1] + codes
+                    if repeat_idx < repeat_times - 1:
+                        last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si], mode=vae.quantizer.z_interplote_down)
+                        last_stage = self.embeds_codes2input(last_stage, bs//B)
+                cum_scales += repeat_times
+                if logprob_only and si >= end_scale:
+                    break
+                if si < len(scale_schedule)-1:
+                    if scale_schedule[si][-2:] == scale_schedule[-1][-2:]:
+                        if self.other_args.noise_input:
+                            summed_codes.append(torch.randn((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
+                        else:
+                            summed_codes.append(torch.zeros((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
+                        if logprob_only:
+                            summed_codes = [summed_codes[-1]]
+                        last_stage = summed_codes[-1]
+                    else:
+                        last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_down)
                     last_stage = self.embeds_codes2input(last_stage, bs//B)
-            cum_scales += repeat_times
-            if si < len(scale_schedule)-1:
-                if scale_schedule[si][-2:] == scale_schedule[-1][-2:]:
-                    if self.other_args.noise_input:
-                        summed_codes.append(torch.randn((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
-                    else:
-                        summed_codes.append(torch.zeros((B, summed_codes[-1].shape[1], *vae_scale_schedule[si+1]), device=summed_codes[-1].device, dtype=summed_codes[-1].dtype))
-                    last_stage = summed_codes[-1]
-                else:
-                    last_stage = F.interpolate(summed_codes[-1], size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_down)
-                last_stage = self.embeds_codes2input(last_stage, bs//B)
-        summed_codes = torch.cat(summed_codes, dim=-3)
-        for b in self.unregistered_blocks: b.attn.kv_caching(False, reset=kv_cache_reset)
-        if return_summed_code_only:
-            return summed_codes
-        else:
-            if low_vram_mode: vae.to('cuda')
-            img = self.summed_codes2images(vae, summed_codes)
-            return idx_Bl_list, img
+            expected_consumed_steps = sum(repeat_counts[:end_scale + 1]) if logprob_only else len(planned_clipids)
+            if trace_step_ptr != expected_consumed_steps:
+                raise RuntimeError(f"Policy consumed {trace_step_ptr} steps; expected {expected_consumed_steps}")
+            selected_token_count = sum(token_count_by_clip) if target_clip is None else token_count_by_clip[target_clip]
+            if expected_token_count is not None and int(expected_token_count) != selected_token_count:
+                raise ValueError(f"Policy scored {selected_token_count} bits; trace records {expected_token_count}")
+            if logprob_only:
+                if selected_token_count <= 0:
+                    raise ValueError("Strict replay target contains no sampled policy bits")
+                return sample_logprob if target_clip is None else sample_logprob_by_clip[target_clip]
+            summed_codes = torch.cat(summed_codes, dim=-3)
+            trace_info = {
+                "trace_schema_version": 3,
+                "logprob_accumulation_dtype": "float64",
+                "idx_trace": trace_tokens,
+                "sample_logprob": sample_logprob.detach().cpu(),
+                "sample_logprob_by_clip": [t.detach().cpu() for t in sample_logprob_by_clip] if sample_logprob_by_clip is not None else None,
+                "step_clipids": step_clipids,
+                "step_is_sampled": trace_is_sampled,
+                "token_count_by_clip": token_count_by_clip,
+            }
+            if return_summed_code_only:
+                if return_trace:
+                    out = {"summed_codes": summed_codes, **trace_info}
+                    return out
+                return summed_codes
+            else:
+                if low_vram_mode: vae.to('cuda')
+                img = self.summed_codes2images(vae, summed_codes)
+                if return_trace:
+                    return idx_Bl_list, img, trace_info
+                return idx_Bl_list, img
+        finally:
+            pbar.close()
+            for block in self.unregistered_blocks:
+                block.attn.kv_caching(False, reset=kv_cache_reset)
+
+    def ar_infer_infinity_elegant_replay_logprob(
+        self, *, vae=None, scale_schedule=None, label_B_or_BLT=None, B=1,
+        negative_label_B_or_BLT=None, g_seed=None, cfg_list=None, tau_list=None,
+        top_k=0, top_p=0.0, trunk_scale=1000, gt_leak=-1, gt_ls_Bl=None,
+        low_vram_mode=False, args=None, get_visual_rope_embeds=None, context_info=None,
+        forced_idx_trace=None, logprob_clipid_target=None, kv_cache_reset=True,
+        skip_text_forward=False, cache_text_as_gt=False, extra_ref_text_scale_inds=None,
+        expected_step_clipids=None, expected_step_is_sampled=None, expected_token_count=None,
+    ):
+        """Differentiably score forced policy bits with the exact sampling loop.
+
+        Call through ``forward(policy_trace_replay_kwargs=...)`` under DDP/FSDP,
+        so the wrapper owns parameter materialization and backward hooks.
+        """
+        if args is None:
+            raise ValueError("Strict replay requires inference arguments")
+        if int(getattr(args, "grpo_replay_checkpointing", 0)):
+            raise ValueError("Stateful KV replay is incompatible with activation checkpointing")
+        for knob in ("INFINITY_GRPO_GRAD_TARGET_CLIP_ONLY", "INFINITY_GRPO_GRAD_TARGET_TAIL_SCALES", "INFINITY_GRPO_TRAIN_LAST_N_BLOCKS"):
+            if int(os.environ.get(knob, "0") or 0):
+                raise ValueError(f"Strict replay does not allow truncated gradients: {knob}")
+        if sp_manager.sp_on():
+            raise ValueError("Strict KV replay requires SP_SIZE=1")
+        return self._ar_infer_infinity_elegant_impl(
+            vae=vae, scale_schedule=scale_schedule, label_B_or_BLT=label_B_or_BLT,
+            B=B, negative_label_B_or_BLT=negative_label_B_or_BLT, g_seed=g_seed,
+            cfg_list=[] if cfg_list is None else cfg_list,
+            tau_list=[] if tau_list is None else tau_list, top_k=top_k, top_p=top_p,
+            trunk_scale=trunk_scale, gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl,
+            low_vram_mode=low_vram_mode, args=args, get_visual_rope_embeds=get_visual_rope_embeds,
+            context_info=context_info, forced_idx_trace=forced_idx_trace,
+            kv_cache_reset=kv_cache_reset, skip_text_forward=skip_text_forward,
+            cache_text_as_gt=cache_text_as_gt, extra_ref_text_scale_inds=extra_ref_text_scale_inds,
+            logprob_only=True, logprob_clipid_target=logprob_clipid_target,
+            expected_step_clipids=expected_step_clipids, expected_step_is_sampled=expected_step_is_sampled,
+            expected_token_count=expected_token_count,
+        )
 
 
     @torch.no_grad()

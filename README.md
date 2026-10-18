@@ -102,7 +102,7 @@ Example (strict closed-loop, enable `allow_future_segments=1`):
 Clients in this repo follow the same pattern:
 
 - **`infer/client.py`** (simulation / dataset example): sends `1, step, step, ...` frames under a stable `session_id`, and writes per-segment `*_actions.json` / `*_poses.json`.
-- **`action_aware_grpo/windows_client.py`** (Windows-side rollout integration / debugging): uses the same session protocol and output format, but is packaged as a Win-friendly client for action-aware GRPO workflows.
+- **`action_aware_grpo/windows_client.py`** (Windows-side rollout integration / debugging): compatibility CLI alias for the canonical `action_aware_grpo/runtime/client.py`; both entry points use the same corrected simulator service and SE(3) action contract.
 
 ## Training
 
@@ -196,6 +196,12 @@ bash train/action_decoder/scripts/train_stageB_ddp.sh
 
 ### Stage 2: Action-aware GRPO
 
+For the exact sampled-token replay path, Windows simulator service, precision
+settings, and a three-update heads-only smoke run, see
+[Online RL guide](./action_aware_grpo/docs/online_rl.md).
+Stage A loads the policy inside its rollout worker; a separate HTTP model
+server is only needed by independent inference clients.
+
 #### Quick start (rollout + train)
 
 Start the local inference service used by rollout:
@@ -228,26 +234,29 @@ UAVFLOW_STAGEA_ROLLOUT_BACKEND=remote_sim \
 UAVFLOW_SIMULATOR_BASE_URL=http://127.0.0.1:18765 \
 UAVFLOW_SIMULATOR_TIMEOUT_S=120 \
 UAVFLOW_TASK_JSON_ROOT=/path/to/uavflow_tasks/select_from_train_jsons \
-bash action_aware_grpo/scripts/run_stagea_collect.sh RUN_ID=remote_sim_smoke TOP_N=1 K_CAND=1 STAGEA_NPROC=1 STAGEA_PROGRESS_EVERY_N=1
+bash action_aware_grpo/scripts/run_stagea_collect.sh RUN_ID=remote_sim_smoke TOP_N=1 K_CAND=2 STAGEA_NPROC=1 STAGEA_PROGRESS_EVERY_N=1
 ```
 
-Run train (partial-freeze optimization):
+Run train (all backbone chunks trainable, FP32 master weights):
 
 ```bash
 CHECKPOINTS_DIR=/path/to/checkpointsinf \
 RUSH_RESUME=/path/to/infinity/global_step_xxx.pth \
 REPLAY_META_DIR=/path/to/replay_meta_rollout_smoke \
-bash action_aware_grpo/scripts/run_stageb_partialfreeze.sh PARTIAL_FREEZE_MODE=smoke RUN_ID=stageb_smoke
+bash action_aware_grpo/scripts/run_stageb_full.sh RUN_ID=stageb_full
 ```
+
+This entry point selects `FREEZE_CHUNK_PREFIX=0` and `GRPO_BLOCK_DTYPE=float32` for optimizer master weights; conflicting inherited settings fail explicitly. With the default `GRPO_FSDP_COMPUTE_DTYPE=none`, collect fresh traces with the default FP32 Stage A policy before training. Optional `GRPO_FSDP_COMPUTE_DTYPE=bfloat16` keeps FP32 masters and uses BF16 transformer forwards, requiring fresh matching BF16 Stage A traces; see the guide for its FSDP requirements. BF16 heads-only smoke traces cannot be reused for the default FP32 forward configuration. Configure asset/data locations and GPU resources for your machine; the BF16-compute/FP32-CPU-master path has now passed an online full-backbone smoke test: two 49-frame trajectories, six clip rewards and one accumulated update using the first clip of each trajectory, with all 36 backbone layers verified changed in the checkpoint. See [the online RL guide](./action_aware_grpo/docs/online_rl.md) for details and the separate partial-freeze entry point.
 
 #### Details
 
 The action-aware GRPO workflow is located under [action_aware_grpo/](./action_aware_grpo) and is organized into two steps: **rollout** and **train**.
 
 - Server entry point: [action_aware_grpo/grpo_server.py](./action_aware_grpo/grpo_server.py)
-- Windows-side client (for action-aware GRPO rollout integration / debugging): [action_aware_grpo/windows_client.py](./action_aware_grpo/windows_client.py)
+- Windows-side client: [action_aware_grpo/windows_client.py](./action_aware_grpo/windows_client.py), a compatibility CLI alias for the canonical [runtime/client.py](./action_aware_grpo/runtime/client.py).
 - Rollout collection: [action_aware_grpo/scripts/run_stagea_collect.sh](./action_aware_grpo/scripts/run_stagea_collect.sh)
-- Train (partial-freeze optimization): [action_aware_grpo/scripts/run_stageb_partialfreeze.sh](./action_aware_grpo/scripts/run_stageb_partialfreeze.sh)
+- Train (full backbone, FP32 masters): [action_aware_grpo/scripts/run_stageb_full.sh](./action_aware_grpo/scripts/run_stageb_full.sh)
+- Optional partial-freeze training: [action_aware_grpo/scripts/run_stageb_partialfreeze.sh](./action_aware_grpo/scripts/run_stageb_partialfreeze.sh)
 - Remote simulator service wrapper: [action_aware_grpo/scripts/run_remote_sim_service.sh](./action_aware_grpo/scripts/run_remote_sim_service.sh)
 - Local inference launcher used by rollout: [action_aware_grpo/run_infer_server.sh](./action_aware_grpo/run_infer_server.sh)
 
