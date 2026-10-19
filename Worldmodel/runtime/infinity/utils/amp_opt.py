@@ -78,7 +78,10 @@ class AmpOptimizer:
     # @profile(precision=4, stream=open('amp_sc.log', 'w+'))
     def backward_clip_step(
         self, ep: int, it: int, g_it: int, stepping: bool, loss: torch.Tensor, clip_decay_ratio=1, stable=False,
+        require_nonzero_grad: bool = False, gradient_callback=None,
     ) -> Tuple[torch.Tensor, Optional[float]]:
+        if not bool(torch.isfinite(loss.detach()).all()):
+            raise FloatingPointError("refusing to backpropagate a non-finite training loss")
         # backward
         loss = loss.mul(self.r_accu)   # r_accu == 1.0 / n_gradient_accumulation
         orig_norm = scaler_sc = None
@@ -93,6 +96,8 @@ class AmpOptimizer:
         # clip gradients then step optimizer
         if stepping:
             if self.scaler is not None: self.scaler.unscale_(self.optimizer)    # now the gradient can be correctly got
+            if gradient_callback is not None:
+                gradient_callback()  # unscaled gradients, before clipping and optimizer mutation
             # if self.fp is not None: self.fp.write(f'[backward_clip_step:137] [it{it}, g_it{g_it}] after scaler.unscale_\n'); self.fp.flush()
             
             skipped, orig_norm = 0, self.last_orig_norm
@@ -106,6 +111,15 @@ class AmpOptimizer:
                     orig_norm: Optional[torch.Tensor] = self.model_maybe_fsdp.clip_grad_norm_(c)
                 else:
                     orig_norm: Optional[torch.Tensor] = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), c)
+            elif require_nonzero_grad:
+                if self.zero:
+                    orig_norm = self.model_maybe_fsdp.clip_grad_norm_(float('inf'))
+                else:
+                    orig_norm = torch.nn.utils.clip_grad_norm_(self.model_maybe_fsdp.parameters(), float('inf'))
+            if orig_norm is not None and not bool(torch.isfinite(orig_norm)):
+                raise FloatingPointError("refusing optimizer step with non-finite gradient norm")
+            if require_nonzero_grad and (orig_norm is None or float(orig_norm) <= 0.0):
+                raise RuntimeError("nonzero GRPO signal produced no policy gradient")
             
             # if self.fp is not None: self.fp.write(f'[backward_clip_step:175] [it{it}, g_it{g_it}] before opt step\n'); self.fp.flush()
             if self.scaler is not None:

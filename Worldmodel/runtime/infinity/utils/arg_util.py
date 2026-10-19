@@ -45,6 +45,7 @@ class Args(Tap):
     device: str = 'cpu'  # Device to use for training ('cpu' or 'cuda')
     is_master_node: bool = None  # Whether the current node is the master node
     epoch: int = 300  # Number of training epochs (total epochs)
+    extra_epochs_after_resume: int = 1  # Ensure at least N epochs run after auto_resume
     cur_epoch: int = 0  # [runtime] current epoch index (for dataset shuffling/logging); do NOT use as total
     log_freq: int = 1  # Logging frequency in stdout
     save_model_iters_freq: int = 1000  # Frequency of saving the model in iterations
@@ -53,7 +54,22 @@ class Args(Tap):
     cfg: float = 0.1  # Classifier-free guidance dropout probability
     rand_uncond: bool = False  # Whether to use random, unlearnable unconditional embedding
     twoclip_alternatingtraining: int = 0  # Whether to use two-clip alternating training
+    trainer_type: str = 'sft'  # sft | grpo
     wp_it: int = 100  # Warm-up iterations
+
+    # ==================================================================================================================
+    # ============================================= Hybrid GRPO + SFT (optional) =======================================
+    # ==================================================================================================================
+    # Dataset-level shuffle of formed batches (IterableDataset). Disable to preserve deterministic ordering patterns,
+    # e.g. 12 offline_grpo clips + 1 sft anchor per trajectory.
+    shuffle_batches: int = 1
+    # If set (e.g. "sft"), override stepping schedule: optimizer step is taken only when the current batch role matches.
+    # Requires dataset to provide `hybrid_roles` in each yielded batch.
+    hybrid_step_on_role: str = ""
+    # Scale factor applied to GRPO RL loss (useful when mixing with a stronger SFT anchor loss).
+    grpo_hybrid_rl_coef: float = 1.0
+    freeze_chunk_prefix: int = 0
+    partial_freeze_print_summary: int = 1
 
     # ==================================================================================================================
     # ===================================================== Model ======================================================
@@ -125,6 +141,7 @@ class Args(Tap):
     workers: int = 16  # Number of dataloader workers
     image_batch_size: int = 0  # [Automatically set] Batch size per GPU for image data
     ac: int = 1  # Gradient accumulation steps
+    max_train_iters: int = 0  # Stop current invocation after N training iterations; 0 disables this limit
     r_accu: float = 1.0  # [Automatically set] Reciprocal of gradient accumulation
     tlen: int = 512  # Truncate text embedding to this length
     num_of_label_value: int = 2  # Number of label values (2 for bitwise, 0 for index-wise)
@@ -190,6 +207,41 @@ class Args(Tap):
     casual_multi_scale: int = 0  # Whether to use casual multi-scale
     temporal_compress_rate: int = 4  # Temporal compression rate
     apply_spatial_patchify: int = 0  # Whether to apply spatial patchify
+
+    # ======================= Exact sampled-token GRPO =======================
+    grpo_initial_logprob_atol: float = 0.05
+    grpo_validate_updates: int = 1
+    grpo_diagnostics_path: str = ''
+    grpo_block_dtype: str = 'float32'  # optimizer/master storage; forward dtype also accounts for nested FSDP MP
+    grpo_fsdp_compute_dtype: str = 'none'  # opt-in bfloat16 chunks with FP32 FSDP masters/root
+    grpo_fsdp_cpu_offload: int = 0  # FSDP CPU parameter/gradient/optimizer offload; ac=1 or controlled ac=2/no_sync
+    grpo_chunk_gradient_diagnostics: int = 0
+    grpo_adv_clip: float = 10.0
+    grpo_ratio_eps: float = 0.2
+    grpo_kl_beta: float = 0.0  # strict replay requires 0; no reference-policy KL implementation
+    grpo_aux_sft_coef: float = 0.0  # strict replay requires 0; no auxiliary SFT loss
+    # Replay the actual autoregressive sampling loop with its recorded tokens.
+    # Approximate trace_ce/proxy_ce scoring is rejected by the GRPO entry point.
+    grpo_new_logprob_mode: str = "trace_replay"
+    # Offload saved activations selectively; parameter views remain owned by FSDP.
+    grpo_replay_save_on_cpu: int = 1
+    grpo_replay_save_on_cpu_pin: int = 1
+    # Stateful KV replay does not support activation checkpointing; nonzero is rejected.
+    grpo_replay_checkpointing: int = 0
+    grpo_require_nonnegative_adv: int = 1
+
+    # Teacher-forcing debug export: decode per-segment latents, run TSformer, and save trajectories.
+    tf_dump_tsformer_enable: int = 0
+    tf_dump_interval: int = 0
+    tf_dump_step_frames: int = 16
+    tf_dump_max_samples_per_step: int = 1
+    tf_dump_out_dir: str = ''
+    tf_dump_save_video: int = 1
+    tf_dump_tsformer_repo_root: str = ''
+    tf_dump_tsformer_ckpt: str = ''
+    tf_dump_tsformer_stats: str = ''
+    tf_dump_ref_pose_json: str = ''
+    tf_dump_expand_factor: int = 4
     
 
     # ==================================================================================================================
@@ -315,7 +367,7 @@ def init_dist_and_get_args():
         if sys.argv[i].startswith('--local-rank=') or sys.argv[i].startswith('--local_rank='):
             del sys.argv[i]
             break
-    args = Args(explicit_bool=True).parse_args(known_only=True)
+    args = Args(explicit_bool=True).parse_args(known_only=False)
     
     if len(args.extra_args) > 0 and args.is_master_node == 0:
         print(f'======================================================================================')

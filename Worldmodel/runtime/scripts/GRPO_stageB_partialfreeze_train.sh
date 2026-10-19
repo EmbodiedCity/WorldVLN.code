@@ -27,40 +27,32 @@ case "${PARTIAL_FREEZE_MODE}" in
   smoke)
     default_freeze_chunk_prefix=5
     default_workers=2
-    default_kl_beta=0.9
+    default_kl_beta=0.0
     default_ratio_eps=0.02
     default_adv_clip=1.0
-    default_aux_sft_coef=0.15
+    default_aux_sft_coef=0.0
     default_max_train_iters=1200
     default_save_model_iters_freq=150
-    default_lambda_act=0.3
-    default_lambda_task=1.3
-    default_lambda_ce=0.03
     default_tlr=1e-6
     default_grad_clip=0.5
     default_train_max_token_len=20480
     default_video_batch_size=1
     default_ac=4
-    default_grpo_weight_mode=raw_reward
     ;;
   main)
     default_freeze_chunk_prefix=4
     default_workers=4
-    default_kl_beta=0.1
+    default_kl_beta=0.0
     default_ratio_eps=0.15
     default_adv_clip=5.0
-    default_aux_sft_coef=0.02
+    default_aux_sft_coef=0.0
     default_max_train_iters=0
     default_save_model_iters_freq=300
-    default_lambda_act=1.0
-    default_lambda_task=1.0
-    default_lambda_ce=1.0
     default_tlr=5e-6
     default_grad_clip=5.0
     default_train_max_token_len=20480
     default_video_batch_size=1
     default_ac=1
-    default_grpo_weight_mode=raw_reward
     ;;
   *)
     echo "[FATAL] Unsupported PARTIAL_FREEZE_MODE=${PARTIAL_FREEZE_MODE}. Use smoke or main."
@@ -71,17 +63,12 @@ esac
 export FREEZE_CHUNK_PREFIX="${FREEZE_CHUNK_PREFIX:-${default_freeze_chunk_prefix}}"
 export PARTIAL_FREEZE_PRINT_SUMMARY="${PARTIAL_FREEZE_PRINT_SUMMARY:-1}"
 export INFINITY_GRPO_TRAIN_LAST_N_BLOCKS="${INFINITY_GRPO_TRAIN_LAST_N_BLOCKS:-0}"
-export GRPO_NEW_LOGPROB_MODE="${GRPO_NEW_LOGPROB_MODE:-trace_ce}"
+export GRPO_NEW_LOGPROB_MODE="${GRPO_NEW_LOGPROB_MODE:-trace_replay}"
 export GRPO_KL_BETA="${GRPO_KL_BETA:-${default_kl_beta}}"
 export GRPO_RATIO_EPS="${GRPO_RATIO_EPS:-${default_ratio_eps}}"
 export GRPO_ADV_CLIP="${GRPO_ADV_CLIP:-${default_adv_clip}}"
 export GRPO_AUX_SFT_COEF="${GRPO_AUX_SFT_COEF:-${default_aux_sft_coef}}"
-export GRPO_LAMBDA_ACT="${GRPO_LAMBDA_ACT:-${default_lambda_act}}"
-export GRPO_LAMBDA_TASK="${GRPO_LAMBDA_TASK:-${default_lambda_task}}"
-export GRPO_LAMBDA_CE="${GRPO_LAMBDA_CE:-${default_lambda_ce}}"
-export GRPO_WEIGHT_MODE="${GRPO_WEIGHT_MODE:-${default_grpo_weight_mode}}"
 export GRPO_REQUIRE_NONNEGATIVE_ADV="${GRPO_REQUIRE_NONNEGATIVE_ADV:-1}"
-export GRPO_LOG_WEIGHT_STATS="${GRPO_LOG_WEIGHT_STATS:-1}"
 export TLR="${TLR:-${default_tlr}}"
 export GRAD_CLIP="${GRAD_CLIP:-${default_grad_clip}}"
 export WORKERS="${WORKERS:-${default_workers}}"

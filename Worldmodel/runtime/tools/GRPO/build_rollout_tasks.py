@@ -67,6 +67,11 @@ def _norm_item(x: Dict[str, Any], default_fps: int, fallback_group_id: str) -> D
     }
     if gt_pose_json:
         out["gt_pose_json"] = str(gt_pose_json)
+    # Dataset layout and coordinate frames are user configuration, not paths
+    # baked into the released source tree.
+    out["gt_pose_frame"] = str(x.get("gt_pose_frame", "initial_body"))
+    if x.get("task_id"):
+        out["task_id"] = str(x["task_id"])
     return out
 
 

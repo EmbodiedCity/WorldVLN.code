@@ -242,11 +242,15 @@ class JointViIterableDataset(IterableDataset):
                     if ('MiniCPM_V_2_6_caption' in meta) and meta['MiniCPM_V_2_6_caption']:
                         caption_type = self.epoch_rank_generator.choice(['tarsier2_caption', 'MiniCPM_V_2_6_caption'])
                     meta['caption'] = meta[caption_type]
-                    if self.enable_dynamic_length_prompt and (self.epoch_rank_generator.random() < self.short_prob):
+                    strict_replay = (
+                        str(meta.get('hybrid_role', getattr(self.other_args, 'trainer_type', 'sft'))).lower() == 'grpo'
+                        and str(getattr(self.other_args, 'grpo_new_logprob_mode', 'trace_replay')).lower() == 'trace_replay'
+                    )
+                    if self.enable_dynamic_length_prompt and not strict_replay and (self.epoch_rank_generator.random() < self.short_prob):
                         meta['caption'] = self.random_drop_sentences(meta['caption'])
-                    if 'quality_prompt' in meta:
+                    if 'quality_prompt' in meta and not strict_replay:
                         meta['caption'] = meta['caption'] + ' ' + meta['quality_prompt']
-                    if self.append_duration2caption:
+                    if self.append_duration2caption and not strict_replay:
                         # Keep the prompt constraint aligned to the whole segment.
                         meta = self.append_duration_info(meta, round(float(mapped_duration), 2))
                     assert meta['caption']
@@ -268,7 +272,7 @@ class JointViIterableDataset(IterableDataset):
                         # keep 4n+1 rule (video_fps should be multiple of 4 in our setups)
                         sample_frames = max(1, 1 + 4 * ((sample_frames - 1) // 4))
                         # If we append duration tags, align to floored seconds to stay close to pretraining distribution.
-                        if self.append_duration2caption:
+                        if self.append_duration2caption and not strict_replay:
                             meta = self.append_duration_info(meta, n_secs * self.duration_resolution)
                     else:
                         sample_frames = int(mapped_duration * self.video_fps + 1)
@@ -542,13 +546,15 @@ class JointViIterableDataset(IterableDataset):
                 addition_pn_images = {}
                 for item in batch_data:
                     if item['raw_features_cthw'] is None:
-                        images.append(item['img_T3HW'].permute(1,0,2,3)) # # tchw -> cthw
+                        if not item.get('strict_trace_replay', False):
+                            images.append(item['img_T3HW'].permute(1,0,2,3)) # tchw -> cthw
                         for key in item:
                             if key.startswith('img_T3HW_'):
                                 if key not in addition_pn_images:
                                     addition_pn_images[key] = []
                                 addition_pn_images[key].append(item[key].permute(1,0,2,3))
-                        feature_cache_files4images.append(item['feature_cache_file'])
+                        if not item.get('strict_trace_replay', False):
+                            feature_cache_files4images.append(item['feature_cache_file'])
                         captions4images.append(item['text_input'])
                         grpo_rewards.append(float(item.get('grpo_reward', 0.0)))
                         grpo_old_logprobs.append(float(item.get('grpo_old_logprob', 0.0)))
@@ -593,7 +599,7 @@ class JointViIterableDataset(IterableDataset):
                         grpo_trace_files.append(item.get('grpo_trace_files', []))
                     text_feature_cache_files.append(item['text_feature_cache_file'])
                     traj_ids.append(str(item.get('traj_id', '')))
-                    hybrid_roles.append(str(item.get('hybrid_role', 'grpo')))
+                    hybrid_roles.append(str(item.get('hybrid_role', getattr(self.other_args, 'trainer_type', 'sft'))))
                 captions = captions4images + captions4raw_features
                 assert len(batch_data), f'len(batch_data)={len(batch_data)}'
                 text_cond_tuple = None
@@ -690,7 +696,7 @@ class JointViIterableDataset(IterableDataset):
                 'text_feature_cache_file': text_feature_cache_file,
                 # Debug/Hybrid routing fields (optional).
                 'traj_id': str(info.get('traj_id', '')),
-                'hybrid_role': str(info.get('hybrid_role', 'grpo')),
+                'hybrid_role': str(info.get('hybrid_role', getattr(self.other_args, 'trainer_type', 'sft'))),
                 'grpo_reward': float(info.get('grpo_reward', 0.0)),
                 'grpo_old_logprob': float(info.get('grpo_old_logprob', 0.0)),
                 'grpo_adv_final': float(info.get('grpo_adv_final', info.get('grpo_weight', 0.0))),
@@ -739,6 +745,19 @@ class JointViIterableDataset(IterableDataset):
         return flag, win_data_item
 
     def prepare_video_input(self, info) -> Tuple:
+        role = str(info.get('hybrid_role', getattr(self.other_args, 'trainer_type', 'sft'))).lower()
+        if role == 'grpo' and str(getattr(self.other_args, 'grpo_new_logprob_mode', 'trace_replay')).lower() == 'trace_replay':
+            paths = info.get('grpo_trace_files')
+            if not isinstance(paths, list) or len(paths) != 1 or not osp.isfile(paths[0]):
+                raise ValueError('strict replay requires one existing complete trace per clip-sample')
+            # The sampling trace contains the exact visual tokens and encoded
+            # text conditions. Re-encoding a decoded video changes those tokens.
+            item = dict(info)
+            item.update(text_input=info['caption'], raw_features_cthw=None,
+                        img_T3HW=None, feature_cache_file=None,
+                        text_features_lenxdim=None, text_feature_cache_file=None,
+                        hybrid_role='grpo', strict_trace_replay=True)
+            return True, item
         filename, begin_frame_id, end_frame_id = (
             info["video_path"],
             info["begin_frame_id"],
@@ -837,7 +856,7 @@ class JointViIterableDataset(IterableDataset):
                 'text_feature_cache_file': text_feature_cache_file,
                 # Debug/Hybrid routing fields (optional).
                 'traj_id': str(info.get('traj_id', '')),
-                'hybrid_role': str(info.get('hybrid_role', 'grpo')),
+                'hybrid_role': str(info.get('hybrid_role', getattr(self.other_args, 'trainer_type', 'sft'))),
                 'grpo_reward': float(info.get('grpo_reward', 0.0)),
                 'grpo_old_logprob': float(info.get('grpo_old_logprob', 0.0)),
                 'grpo_adv_final': float(info.get('grpo_adv_final', info.get('grpo_weight', 0.0))),

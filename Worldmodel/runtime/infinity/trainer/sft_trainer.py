@@ -485,6 +485,186 @@ class InfinityTrainer(object):
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"[TF-TS] dumped trajectories to: {run_dir}")
     
+    def _train_sampling_trace(self, *, epoch, it, g_it, stepping, clip_decay_ratio,
+                              metric_lg, args, trace_files, old_logprobs,
+                              advantages, clip_ids, rewards):
+        """Replay the actual behavior tokens through the normal model wrapper.
+
+        This path never encodes a decoded rollout video or runs an auxiliary SFT
+        forward. FSDP/DDP own the complete forward/backward parameter lifecycle.
+        """
+        from types import SimpleNamespace
+        from infinity.trainer.strict_grpo import (
+            clipped_policy_loss, load_sampling_trace, move_text_conditions,
+            parameter_probes, compare_parameter_probes,
+        )
+        from infinity.utils.fsdp_grpo import (
+            transformer_precision, transformer_chunks, chunk_gradient_statistics,
+            validate_replay_execution_schedule,
+        )
+        if float(args.grpo_aux_sft_coef) != 0 or float(args.grpo_kl_beta) != 0:
+            raise ValueError("exact trace_replay currently requires grpo_aux_sft_coef=0 and grpo_kl_beta=0; no approximate CE/KL fallback is permitted")
+        if not isinstance(trace_files, list) or not trace_files:
+            raise ValueError("exact GRPO requires a nonempty batch of trace files")
+        n = len(trace_files)
+        if not isinstance(old_logprobs, list) or not isinstance(advantages, list) or len(old_logprobs) != n or len(advantages) != n:
+            raise ValueError("exact GRPO needs aligned, explicit old logprobs and advantages")
+        # Load the complete local batch before any model forward. Different
+        # autoregressive lengths across ranks would interleave FSDP collectives.
+        traces = []
+        for paths in trace_files:
+            if not isinstance(paths, list) or len(paths) != 1:
+                raise ValueError("one clip-sample must reference exactly one complete sampling trace")
+            traces.append(load_sampling_trace(paths[0]))
+        if int(getattr(args, "zero", 0)):
+            validate_replay_execution_schedule(traces)
+        model = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, "_orig_mod") else self.gpt_wo_ddp
+        device = torch.device(args.device)
+        weights = torch.as_tensor(advantages, dtype=torch.float32, device=device)
+        if not bool(torch.isfinite(weights).all()):
+            raise FloatingPointError("non-finite GRPO advantage")
+        if int(args.grpo_require_nonnegative_adv) and bool((weights < 0).any()):
+            raise ValueError("negative advantage under the configured nonnegative reward scheme")
+        if float(args.grpo_adv_clip) > 0:
+            weights = weights.clamp(-float(args.grpo_adv_clip), float(args.grpo_adv_clip))
+        old = torch.as_tensor(old_logprobs, dtype=torch.float64, device=device)
+        validate = bool(int(getattr(args, "grpo_validate_updates", 1)))
+        probes_before = parameter_probes(model) if validate and stepping else None
+        original_training = self.gpt.training
+        original_drop = model.cond_drop_rate
+        # eval() disables stochastic layers; it does not disable autograd.
+        self.gpt.eval()
+        model.cond_drop_rate = 0.0
+        new_values, counts, offload_stats = [], [], []
+        precision_report = transformer_precision(model)
+        try:
+            for si, trace in enumerate(traces):
+                actual_dtype = precision_report['block_forward_dtype']
+                if actual_dtype and str(trace['block_parameter_dtype']).replace('torch.', '') != actual_dtype:
+                    raise ValueError(f'behavior/training transformer forward dtype differs: {trace["block_parameter_dtype"]} != {actual_dtype}; masters={precision_report["block_master_dtypes"]}')
+                precision = int(getattr(args, 'fp16', 0))
+                amp_dtype = 'bfloat16' if precision == 2 else ('float16' if precision > 0 else 'float32')
+                if str(trace['autocast_dtype']).replace('torch.', '') != amp_dtype:
+                    raise ValueError(f'behavior/training autocast dtype differs: {trace["autocast_dtype"]} != {amp_dtype}')
+                target = int(trace["clipid_target"])
+                if clip_ids is not None and int(clip_ids[si]) != target:
+                    raise ValueError("metadata clip id differs from the trace target")
+                if abs(float(old_logprobs[si]) - float(trace["sample_logprob"])) > 1e-4:
+                    raise ValueError("metadata old_logprob differs from the saved sampling logprob")
+                replay_args = vars(args).copy()
+                for key in ("image_scale_repetition", "video_scale_repetition", "max_repeat_times", "noise_input", "semantic_scales", "use_cfg", "use_apg", "apg_norm_threshold"):
+                    if key in trace:
+                        replay_args[key] = trace[key]
+                replay_args.setdefault("use_cfg", 1)
+                replay_args.setdefault("use_apg", 0)
+                replay_args.setdefault("max_repeat_times", 999999)
+                replay_args.setdefault("apg_norm_threshold", 0.0)
+                counts.append(int(trace["sample_token_count_by_clip"][target]))
+                replay_kw = dict(
+                    vae=self.vae_local, scale_schedule=trace["scale_schedule"], B=1,
+                    negative_label_B_or_BLT=(move_text_conditions(trace["negative_text_cond_tuple"], device) if trace.get("negative_text_cond_tuple") is not None else None),
+                    g_seed=None, cfg_list=[float(trace["infinity_cfg"])] * len(trace["scale_schedule"]),
+                    tau_list=[float(x) for x in trace["tau_list"]],
+                    top_k=int(trace.get("top_k", 0)), top_p=float(trace.get("top_p", 1.0)),
+                    trunk_scale=1000, gt_leak=int(trace.get("gt_leak", -1)),
+                    gt_ls_Bl=trace.get("gt_ls_Bl"), low_vram_mode=False,
+                    args=SimpleNamespace(**replay_args), get_visual_rope_embeds=self.get_visual_rope_embeds,
+                    context_info=trace["context_info"], forced_idx_trace=trace["idx_trace"],
+                    logprob_clipid_target=target, kv_cache_reset=True,
+                    skip_text_forward=False, cache_text_as_gt=False,
+                    expected_step_clipids=trace["step_clipids"],
+                    expected_step_is_sampled=trace["step_is_sampled"], expected_token_count=counts[-1],
+                )
+                save_ctx = nullcontext()
+                if int(args.grpo_replay_save_on_cpu) and device.type == "cuda":
+                    from infinity.utils.selective_offload import selective_save_on_cpu
+                    save_ctx = selective_save_on_cpu(self.gpt, pin_memory=bool(args.grpo_replay_save_on_cpu_pin))
+                with save_ctx as offload, self.gpt_opt.amp_ctx:
+                    value = self.gpt(
+                        move_text_conditions(trace["text_cond_tuple"], device), None,
+                        policy_trace_replay_kwargs=replay_kw,
+                    )
+                if offload is not None:
+                    offload_stats.append(offload.stats)
+                if isinstance(value, dict):
+                    value = value["sample_logprob"]
+                if value.dtype != torch.float64:
+                    raise ValueError('strict replay must return FP64 summed logprob; update the sampling/replay core')
+                new_values.append(value.reshape(-1)[0].double())
+        finally:
+            model.cond_drop_rate = original_drop
+            self.gpt.train(original_training)
+        new = torch.stack(new_values)
+        losses, ratio, delta = clipped_policy_loss(new, old, weights, float(args.grpo_ratio_eps))
+        if not getattr(self, "_strict_policy_has_updated", False):
+            tolerance = float(getattr(args, "grpo_initial_logprob_atol", 0.05))
+            if float(delta.detach().abs().max()) > tolerance:
+                raise RuntimeError(f"initial replay logprob mismatch: max |new-old|={float(delta.detach().abs().max()):.6g}, tolerance={tolerance}; check behavior checkpoint and trace settings")
+        final_loss = losses.mean() * float(args.grpo_hybrid_rl_coef)
+        active = ((weights > 0) & (ratio.detach() <= 1.0 + float(args.grpo_ratio_eps))) | ((weights < 0) & (ratio.detach() >= 1.0 - float(args.grpo_ratio_eps)))
+        self._strict_accumulated_signal = bool(getattr(self, "_strict_accumulated_signal", False) or active.any().item())
+        chunk_gradients = []
+        def record_chunk_gradients():
+            chunk_gradients.extend(chunk_gradient_statistics(
+                model, device, require_nonzero=bool(validate and self._strict_accumulated_signal),
+            ))
+        grad_norm, scale_log2 = self.gpt_opt.backward_clip_step(
+            ep=epoch, it=it, g_it=g_it, stepping=stepping, loss=final_loss,
+            clip_decay_ratio=clip_decay_ratio,
+            require_nonzero_grad=bool(validate and self._strict_accumulated_signal),
+            gradient_callback=(record_chunk_gradients if int(getattr(args, "grpo_chunk_gradient_diagnostics", 0)) else None),
+        )
+        frozen_grad_count = sum(int(p.grad is not None) for p in model.parameters() if not p.requires_grad)
+        if frozen_grad_count:
+            raise RuntimeError("frozen parameters unexpectedly have gradients")
+        frozen_change = trainable_change = 0.0
+        if stepping:
+            self._strict_policy_has_updated = True
+            self._strict_accumulated_signal = False
+            if probes_before is not None:
+                frozen_change, trainable_change = compare_parameter_probes(probes_before, parameter_probes(model))
+            if args.use_fsdp_model_ema and args.model_ema_decay < 1:
+                update_ema(self.gpt_ema, self.gpt)
+            self.gpt_opt.optimizer.zero_grad(set_to_none=True)
+        chunks = transformer_chunks(model)
+        trainable_chunks = [i for i, chunk in enumerate(chunks) if any(p.requires_grad for p in chunk.parameters())]
+        parameter_counts = torch.tensor([
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
+            sum(p.numel() for p in model.parameters() if not p.requires_grad),
+        ], device=device, dtype=torch.int64)
+        if int(getattr(args, "zero", 0)) and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(parameter_counts, op=torch.distributed.ReduceOp.SUM)
+        trainable_count, frozen_count = parameter_counts.cpu().tolist()
+        summary = dict(
+            global_it=int(g_it) + 1, optimizer_step=bool(stepping),
+            objective="sampled_token_ppo", loss=float(final_loss.detach()),
+            optimization_scope=("heads-only" if chunks and not trainable_chunks else
+                                "full-backbone" if chunks and len(trainable_chunks) == len(chunks) else "parameter-subset"),
+            trainable_chunk_indices=trainable_chunks,
+            trainable_parameters=int(trainable_count), frozen_parameters=int(frozen_count),
+            **precision_report, chunk_gradients=chunk_gradients, selective_offload=offload_stats,
+            ratio_min=float(ratio.detach().min()), ratio_max=float(ratio.detach().max()),
+            logprob_delta_max=float(delta.detach().abs().max()),
+            old_logprob=[float(x) for x in old.detach().cpu()],
+            new_logprob=[float(x) for x in new.detach().cpu()],
+            advantages=[float(x) for x in weights.detach().cpu()], token_counts=counts,
+            active_policy_samples=int(active.sum()),
+            grad_norm=float(grad_norm) if grad_norm is not None else None,
+            frozen_gradient_tensors=frozen_grad_count, frozen_probe_max_change=frozen_change,
+            trainable_probe_max_change=trainable_change, rank=int(dist.get_rank()),
+        )
+        self._last_strict_diagnostics = summary
+        metric_lg.update(L=summary["loss"], Acc=0.0, L_i=0.0, L_v=0.0, Acc_i=0.0, Acc_v=0.0,
+                         tnm=grad_norm, seq_usage=100.0, adv=float(weights.mean()),
+                         ratio_min=summary["ratio_min"], ratio_max=summary["ratio_max"])
+        if dist.is_master():
+            diagnostics_path = str(getattr(args, "grpo_diagnostics_path", "") or osp.join(args.local_out_path, "strict_grpo_updates.jsonl"))
+            os.makedirs(osp.dirname(osp.abspath(diagnostics_path)), exist_ok=True)
+            with open(diagnostics_path, "a", encoding="utf-8") as output:
+                output.write(json.dumps(summary, ensure_ascii=False, allow_nan=False) + "\n")
+            print("[strict-grpo] " + json.dumps(summary, ensure_ascii=False, allow_nan=False), flush=True)
+        return grad_norm, scale_log2
+
     def train_step(
         self, epoch: int, it: int, g_it: int, stepping: bool, clip_decay_ratio: float, metric_lg: misc.MetricLogger,
         raw_features_bcthw: FTen, feature_cache_files4images: list, media: str,
@@ -510,6 +690,21 @@ class InfinityTrainer(object):
         traj_ids: Optional[list] = None,
         hybrid_roles: Optional[list] = None,
     ) -> Tuple[torch.Tensor, Optional[float]]:
+        trainer_type = str(getattr(args, "trainer_type", "sft")).lower()
+        if hybrid_roles:
+            roles = {str(role or "").lower() for role in hybrid_roles}
+            if len(roles) != 1:
+                raise ValueError("one training batch must have a single hybrid role")
+            trainer_type = next(iter(roles))
+        if trainer_type == "grpo":
+            if str(args.grpo_new_logprob_mode).lower() != "trace_replay":
+                raise ValueError("GRPO supports exact trace_replay only; trace_ce/proxy_ce change the behavior distribution")
+            return self._train_sampling_trace(
+                epoch=epoch, it=it, g_it=g_it, stepping=stepping, clip_decay_ratio=clip_decay_ratio,
+                metric_lg=metric_lg, args=args, trace_files=grpo_trace_files,
+                old_logprobs=grpo_old_logprobs, advantages=grpo_adv_finals,
+                clip_ids=grpo_clip_ids, rewards=grpo_rewards,
+            )
         device = args.device
         B = len(inp_B3HW) + len(raw_features_bcthw)
 
@@ -548,12 +743,11 @@ class InfinityTrainer(object):
                 tokens_remain=args.train_max_token_len,
             )
 
-            # In strict GRPO (trace_replay), the learning signal comes from replayed logp_new,
-            # not from the per-token CE loss graph. Keeping the CE autograd graph alongside
-            # the replay graph can exceed 80G even on A100.
+            # SFT/legacy packed-forward branch. Exact GRPO already returned through
+            # _train_sampling_trace above and never builds this per-token CE graph.
             trainer_type = str(getattr(args, "trainer_type", "sft") or "sft").strip().lower()
-            # Optional per-batch hybrid override (works best with video_batch_size=1):
-            # allow switching between GRPO and sft based on dataset-provided role.
+            # Historical role handling retained in this branch; the current entry
+            # point resolves each batch's role before dispatching exact GRPO.
             if isinstance(hybrid_roles, list) and len(hybrid_roles) > 0:
                 uniq = {str(x or "").strip().lower() for x in hybrid_roles}
                 uniq.discard("")
@@ -567,9 +761,9 @@ class InfinityTrainer(object):
             new_mode = str(getattr(args, "grpo_new_logprob_mode", "trace_replay") or "trace_replay").strip().lower()
             aux = float(getattr(args, "grpo_aux_sft_coef", 0.0) or 0.0)
             pg_only_flag = int(getattr(args, "grpo_pg_only", 1) or 0) == 1
-            # In strict GRPO, the only gradient-bearing term is the PPO objective (computed from trace replay/CE).
-            # We keep the big packed forward in no_grad to save memory even if aux>0, and implement any auxiliary
-            # stabilizer loss inside the strict logprob path (so it doesn't force a full packed backward).
+            # Historical packed-forward switches below are not used by exact GRPO.
+            # The released replay path always uses its own graph and rejects
+            # nonzero auxiliary SFT/KL coefficients before reaching this branch.
             pg_only = bool(use_grpo and new_mode in ("trace_replay", "trace_ce") and pg_only_flag)
 
             if pg_only:
@@ -628,766 +822,7 @@ class InfinityTrainer(object):
             oldlp_t = None
             pg_by_sample: Optional[torch.Tensor] = None
             aux_sft_by_sample: Optional[torch.Tensor] = None
-            if use_grpo:
-                n_s = len(raw_features_list)
-                if isinstance(grpo_rewards, list) and len(grpo_rewards) == n_s:
-                    reward_t = torch.tensor(grpo_rewards, dtype=loss.dtype, device=loss.device)
-                if isinstance(grpo_old_logprobs, list) and len(grpo_old_logprobs) == len(raw_features_list):
-                    oldlp_t = torch.tensor(grpo_old_logprobs, dtype=loss.dtype, device=loss.device)
-                if bool(int(getattr(args, "grpo_require_old_logprob", 1))):
-                    if oldlp_t is None:
-                        raise RuntimeError(
-                            "GRPO strict mode requires grpo_old_logprob per sample; got missing/length-mismatch list."
-                        )
-                    if isinstance(grpo_trace_files, list) and len(grpo_trace_files) == n_s:
-                        for i_tf, tf in enumerate(grpo_trace_files):
-                            if not isinstance(tf, list) or len(tf) <= 0:
-                                raise RuntimeError(f"GRPO strict mode requires grpo_trace_files; sample[{i_tf}] missing")
-                    else:
-                        raise RuntimeError("GRPO strict mode requires grpo_trace_files list aligned with batch")
-                # Preferred path: consume StageA-precomputed final advantage directly.
-                # Legacy fallback: reconstruct weights from reward levels inside the current batch.
-                if isinstance(grpo_adv_finals, list) and len(grpo_adv_finals) == n_s:
-                    w_np = np.asarray([float(x) for x in grpo_adv_finals], dtype=np.float64)
-                    adv_clip = float(getattr(args, "grpo_adv_clip", 0.0))
-                    if adv_clip and adv_clip > 0:
-                        w_np = np.clip(w_np, -adv_clip, adv_clip)
-                    weight_t = torch.tensor(w_np, dtype=loss.dtype, device=loss.device)
-                if (
-                    isinstance(grpo_reward_acts, list)
-                    and len(grpo_reward_acts) == n_s
-                    and isinstance(grpo_reward_tasks, list)
-                    and len(grpo_reward_tasks) == n_s
-                ):
-                    r_act_np = np.asarray([float(x) for x in grpo_reward_acts], dtype=np.float64)
-                    r_task_np = np.asarray([float(x) for x in grpo_reward_tasks], dtype=np.float64)
-                    r_ce_np = (
-                        np.asarray([float(x) for x in grpo_reward_ces], dtype=np.float64)
-                        if isinstance(grpo_reward_ces, list) and len(grpo_reward_ces) == n_s
-                        else np.zeros((n_s,), dtype=np.float64)
-                    )
-                    reward_act_t = torch.tensor(r_act_np, dtype=loss.dtype, device=loss.device)
-                    reward_task_t = torch.tensor(r_task_np, dtype=loss.dtype, device=loss.device)
-                    if isinstance(grpo_reward_task_raws, list) and len(grpo_reward_task_raws) == n_s:
-                        reward_task_raw_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_reward_task_raws], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_reward_task_dense_raws, list) and len(grpo_reward_task_dense_raws) == n_s:
-                        reward_task_dense_raw_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_reward_task_dense_raws], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_reward_task_success_raws, list) and len(grpo_reward_task_success_raws) == n_s:
-                        reward_task_success_raw_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_reward_task_success_raws], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_succs, list) and len(grpo_succs) == n_s:
-                        succ_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_succs], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_succ_trajs, list) and len(grpo_succ_trajs) == n_s:
-                        succ_traj_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_succ_trajs], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_task_final_costs, list) and len(grpo_task_final_costs) == n_s:
-                        task_cost_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_task_final_costs], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_task_final_pos_errs, list) and len(grpo_task_final_pos_errs) == n_s:
-                        task_pos_err_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_task_final_pos_errs], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    if isinstance(grpo_task_final_yaw_errs, list) and len(grpo_task_final_yaw_errs) == n_s:
-                        task_yaw_err_t = torch.tensor(
-                            np.asarray([float(x) for x in grpo_task_final_yaw_errs], dtype=np.float64),
-                            dtype=loss.dtype,
-                            device=loss.device,
-                        )
-                    reward_ce_t = torch.tensor(r_ce_np, dtype=loss.dtype, device=loss.device)
-                    lam_act = float(getattr(args, "grpo_lambda_act", 1.0))
-                    lam_task = float(getattr(args, "grpo_lambda_task", 1.0))
-                    lam_ce = float(getattr(args, "grpo_lambda_ce", 0.0))
-                    r_np = lam_act * r_act_np + lam_task * r_task_np + lam_ce * r_ce_np
-                    if reward_t is None:
-                        reward_t = torch.tensor(r_np, dtype=loss.dtype, device=loss.device)
-                    if weight_t is not None:
-                        mode = ""
-                    else:
-                        mode = str(getattr(args, "grpo_weight_mode", "raw_reward") or "raw_reward").strip().lower()
-
-                    # Build groups if available; else treat each sample as its own group.
-                    groups: Dict[str, List[int]] = {}
-                    if isinstance(grpo_group_ids, list) and len(grpo_group_ids) == n_s:
-                        for i, gid in enumerate(grpo_group_ids):
-                            key = str(gid) if str(gid) else f"__single_{i}"
-                            groups.setdefault(key, []).append(i)
-                    else:
-                        for i in range(n_s):
-                            groups[f"__single_{i}"] = [i]
-
-                    w_np = np.asarray(r_np, dtype=np.float64).copy()
-                    if mode == "gate_mean":
-                        for _, inds in groups.items():
-                            idx = np.asarray(inds, dtype=np.int64)
-                            mu = float(np.mean(r_np[idx])) if idx.size > 0 else 0.0
-                            m = (r_np[idx] >= mu).astype(np.float64)
-                            w_np[idx] = w_np[idx] * m
-                    elif mode == "rank_gate":
-                        clip_ids_np = np.asarray(
-                            [int(x) if x is not None else 1 for x in (grpo_clip_ids or [1] * n_s)],
-                            dtype=np.int64,
-                        )
-
-                        def _rank01_average_ties(vals: np.ndarray) -> np.ndarray:
-                            n = int(vals.shape[0])
-                            if n <= 1:
-                                return np.zeros((n,), dtype=np.float64)
-                            order = np.argsort(vals, kind="mergesort")
-                            ranks = np.zeros((n,), dtype=np.float64)
-                            i = 0
-                            while i < n:
-                                j = i
-                                while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
-                                    j += 1
-                                avg_rank = 0.5 * (i + j)
-                                ranks[order[i : j + 1]] = avg_rank
-                                i = j + 1
-                            return ranks / float(max(1, n - 1))
-
-                        alpha = float(getattr(args, "grpo_alpha_decay", 0.9))
-                        w_rank = np.zeros((n_s,), dtype=np.float64)
-                        for _, inds in groups.items():
-                            idx = np.asarray(inds, dtype=np.int64)
-                            # rank-map on combined reward only (no act/task split required)
-                            s = _rank01_average_ties(r_np[idx])
-                            mu = float(np.mean(r_np[idx])) if idx.size > 0 else 0.0
-                            m = (r_np[idx] >= mu).astype(np.float64)
-                            decay = np.power(alpha, np.maximum(0, clip_ids_np[idx] - 1))
-                            w_rank[idx] = decay * m * s
-                        w_np = w_rank
-                    elif mode == "raw_reward":
-                        # raw_reward: keep w_np = raw combined reward
-                        pass
-                    if mode:
-                        # Optional safety clip (does not change ordering, just bounds magnitude).
-                        adv_clip = float(getattr(args, "grpo_adv_clip", 0.0))
-                        if adv_clip and adv_clip > 0:
-                            w_np = np.clip(w_np, -adv_clip, adv_clip)
-                        weight_t = torch.tensor(w_np, dtype=loss.dtype, device=loss.device)
-                elif reward_t is not None and weight_t is None:
-                    # Fallback: if only grpo_reward is present.
-                    w = reward_t
-                    adv_clip = float(getattr(args, "grpo_adv_clip", 0.0))
-                    if adv_clip and adv_clip > 0:
-                        w = w.clamp(min=-adv_clip, max=adv_clip)
-                    weight_t = w
-                # Safety: never allow NaN/Inf rewards/logprobs to poison PPO loss.
-                if weight_t is not None:
-                    weight_t = torch.nan_to_num(weight_t, nan=0.0, posinf=0.0, neginf=0.0)
-                    if bool(int(getattr(args, "grpo_require_nonnegative_adv", 1))):
-                        if torch.any(weight_t < -1e-6):
-                            raise RuntimeError("grpo_adv_final contains negative weights under 0410 non-negative scheme")
-                if reward_t is not None:
-                    reward_t = torch.nan_to_num(reward_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if reward_act_t is not None:
-                    reward_act_t = torch.nan_to_num(reward_act_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if reward_task_t is not None:
-                    reward_task_t = torch.nan_to_num(reward_task_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if reward_task_raw_t is not None:
-                    reward_task_raw_t = torch.nan_to_num(reward_task_raw_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if task_cost_t is not None:
-                    task_cost_t = torch.nan_to_num(task_cost_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if task_pos_err_t is not None:
-                    task_pos_err_t = torch.nan_to_num(task_pos_err_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if task_yaw_err_t is not None:
-                    task_yaw_err_t = torch.nan_to_num(task_yaw_err_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if reward_ce_t is not None:
-                    reward_ce_t = torch.nan_to_num(reward_ce_t, nan=0.0, posinf=0.0, neginf=0.0)
-                if oldlp_t is not None:
-                    oldlp_t = torch.nan_to_num(oldlp_t, nan=0.0, posinf=0.0, neginf=0.0)
-                # Strict PPO/GRPO ratio needs logprob_new computed on the SAME sampled token trace.
-                # Default to trace replay in the GRPO replay path.
-                newlp_t: Optional[torch.Tensor] = None
-                new_mode = str(getattr(args, "grpo_new_logprob_mode", "trace_replay") or "trace_replay").strip().lower()
-                if oldlp_t is not None and weight_t is not None and new_mode in ("trace_replay", "trace_ce"):
-                    if not (isinstance(grpo_trace_files, list) and len(grpo_trace_files) == n_s):
-                        raise RuntimeError("trace_replay requires grpo_trace_files aligned with batch")
-                    # Slice a per-sample text_cond_tuple from packed kv_compact.
-                    def _slice_text_cond_tuple(tup, sample_i: int):
-                        kv_compact, lens, cu_seqlens_k, max_seqlen_k = tup
-                        le = int(lens[sample_i])
-                        st = int(cu_seqlens_k[sample_i].item()) if hasattr(cu_seqlens_k[sample_i], "item") else int(cu_seqlens_k[sample_i])
-                        ed = st + le
-                        kv_i = kv_compact[st:ed]
-                        lens_i = [le]
-                        cu_i = torch.tensor([0, le], device=kv_compact.device, dtype=cu_seqlens_k.dtype)
-                        return (kv_i, lens_i, cu_i, le)
-
-                    # Build a minimal infer-args shim for inference-only fields.
-                    import types as _types
-                    base = vars(args).copy()
-                    base.setdefault("use_cfg", 1)
-                    base.setdefault("use_apg", 0)
-                    base.setdefault("max_repeat_times", int(getattr(args, "max_repeat_times", 999999)))
-                    base.setdefault("apg_norm_threshold", float(getattr(args, "apg_norm_threshold", 0.0)))
-                    infer_args = _types.SimpleNamespace(**base)
-
-                    # IMPORTANT:
-                    # Trace-replay runs a custom autoregressive loop (NOT model.forward),
-                    # so when using FSDP (zero=3), root-owned parameters (e.g. cfg_uncond/text_proj)
-                    # remain sharded unless we explicitly unshard them.
-                    # However, the big transformer chunks are wrapped as nested FSDP units and will
-                    # unshard themselves on their own forward calls inside replay.
-                    #
-                    # Strategy: if self.gpt is FSDP, temporarily summon FULL params for the ROOT FSDP
-                    # instance only (recurse=False) so root-owned params are materialized, then call
-                    # replay on the underlying module. This avoids gathering the entire 8B model on
-                    # each rank.
-                    try:
-                        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP  # type: ignore
-                    except Exception:
-                        FSDP = None  # type: ignore
-                    gpt_fsdp = getattr(self, "gpt", None)
-                    use_root_fsdp_unshard = FSDP is not None and gpt_fsdp is not None and isinstance(gpt_fsdp, FSDP)
-                    if use_root_fsdp_unshard:
-                        gpt_replay = gpt_fsdp.module
-                        fsdp_ctx = FSDP.summon_full_params(gpt_fsdp, recurse=False, writeback=False)
-                    else:
-                        gpt_replay = self.gpt_wo_ddp._orig_mod if hasattr(self.gpt_wo_ddp, "_orig_mod") else self.gpt_wo_ddp
-                        fsdp_ctx = nullcontext()
-
-                    model_dtype = next(iter(gpt_replay.parameters())).dtype
-                    newlp_t = torch.zeros((n_s,), dtype=loss.dtype, device=loss.device)
-                    tok_t = torch.ones((n_s,), dtype=loss.dtype, device=loss.device)
-                    if float(aux) > 0 and new_mode == "trace_ce":
-                        aux_sft_by_sample = torch.zeros((n_s,), dtype=loss.dtype, device=loss.device)
-                    with fsdp_ctx:
-                        for si in range(n_s):
-                            tfl = grpo_trace_files[si]
-                            tf0 = tfl[0] if isinstance(tfl, list) and len(tfl) > 0 else ""
-                            if not tf0 or (not osp.exists(tf0)):
-                                raise RuntimeError(f"trace_replay missing trace file for sample[{si}]: {tf0}")
-                            tr = torch.load(tf0, map_location="cpu")
-                            idx_trace = tr.get("idx_trace", None)
-                            if idx_trace is None:
-                                raise RuntimeError(f"trace_replay missing idx_trace in {tf0}")
-                            clipid_target = tr.get("clipid_target", None)
-                            try:
-                                clipid_target_i = int(clipid_target) if clipid_target is not None else None
-                            except Exception:
-                                clipid_target_i = None
-                            # Token count for selected-token KL normalization.
-                            tok_cnt = 0
-                            try:
-                                # If step_clipids is present, only count tokens belonging to the target clip.
-                                step_clipids = tr.get("step_clipids", None)
-                                use_step_clipids = (
-                                    clipid_target_i is not None
-                                    and isinstance(step_clipids, list)
-                                    and isinstance(idx_trace, list)
-                                    and len(step_clipids) == len(idx_trace)
-                                )
-                                if isinstance(idx_trace, list):
-                                    for k, t in enumerate(idx_trace):
-                                        if use_step_clipids and int(step_clipids[k]) != int(clipid_target_i):
-                                            continue
-                                        if isinstance(t, torch.Tensor):
-                                            tok_cnt += int(t.numel())
-                                        else:
-                                            tok_cnt += int(np.asarray(t).size)
-                                else:
-                                    tok_cnt = int(np.asarray(idx_trace).size)
-                                tok_t[si] = float(max(1, tok_cnt))
-                            except Exception:
-                                tok_t[si] = 1.0
-                            scale_schedule = tr.get("scale_schedule", None)
-                            context_info = tr.get("context_info", None)
-                            if scale_schedule is None or context_info is None:
-                                raise RuntimeError(
-                                    f"trace_replay requires scale_schedule/context_info in {tf0} (rerun StageA after server update)"
-                                )
-                            cfg_scale = float(tr.get("infinity_cfg", 1.0))
-                            # Debug/memory knob: force CFG=1.0 during StageB trace-replay.
-                            # This disables the cond+uncond double-branch (bs=2*B) in prepare_text_conditions,
-                            # and can halve replay KV/activation memory.
-                            #
-                            # IMPORTANT: this breaks strict PPO semantics if StageA old_logprob was collected
-                            # under cfg!=1. Use only for debugging OOM; for strict runs, rerun StageA with cfg=1.
-                            try:
-                                import os as _os
-                                v = _os.environ.get("INFINITY_GRPO_FORCE_CFG", "").strip()
-                                if v:
-                                    cfg_scale = float(v)
-                            except Exception:
-                                pass
-                            tau_list = tr.get("tau_list", None)
-                            if not isinstance(tau_list, list) or len(tau_list) < len(scale_schedule):
-                                raise RuntimeError(f"trace_replay requires tau_list aligned to scale_schedule in {tf0}")
-                            top_k = int(tr.get("top_k", 0))
-                            top_p = float(tr.get("top_p", 0.0))
-                            gt_leak = int(tr.get("gt_leak", -1))
-                            gt_ls_Bl = tr.get("gt_ls_Bl", None)
-                            if gt_leak > 0 and gt_ls_Bl is None:
-                                raise RuntimeError(
-                                    f"trace_replay requires gt_ls_Bl when gt_leak>0 in {tf0} (rerun StageA after server update)"
-                                )
-                            # Optional debug: print which clip is being replayed (helps pinpoint clip3-only OOM).
-                            try:
-                                import os as _os
-                                if int(_os.environ.get("INFINITY_GRPO_DEBUG_REPLAY", "0") or 0) == 1:
-                                    rk = int(_os.environ.get("RANK", "-1") or -1)
-                                    if rk in (-1, 0):
-                                        print(
-                                            f"[grpo][replay] si={si} clipid_target={clipid_target_i} "
-                                            f"cfg={cfg_scale} gt_leak={gt_leak} scales={len(scale_schedule)} "
-                                            f"tok_cnt={tok_cnt} trace={tf0}"
-                                        )
-                            except Exception:
-                                pass
-                            # NOTE (memory): gt_ls_Bl can be ~10+ MiB per sample for long prefixes.
-                            # Moving the entire list to GPU upfront can trigger CUDA OOM when replay is near the limit.
-                            # We pass it through as-is and let replay move per-step slices as needed.
-                            gt_ls_gpu = gt_ls_Bl
-                            cfg_list = [cfg_scale] * int(len(scale_schedule))
-                            label_i = _slice_text_cond_tuple(text_cond_tuple, si)
-                            if new_mode == "trace_replay":
-                                # Memory safety for strict trace-replay:
-                                # Offload saved tensors to CPU to prevent GPU OOM.
-                                use_save_on_cpu = int(getattr(args, "grpo_replay_save_on_cpu", 1) or 0) == 1
-                                pin_save_on_cpu = int(getattr(args, "grpo_replay_save_on_cpu_pin", 1) or 0) == 1
-                                # Optional: only offload the heaviest clip (typically clipid_target==3).
-                                # This keeps strictness (exact gradient), but can avoid host OOM by not offloading every sample.
-                                try:
-                                    import os as _os
-                                    if int(_os.environ.get("INFINITY_GRPO_SAVE_ON_CPU_CLIP3_ONLY", "0") or 0) == 1:
-                                        use_save_on_cpu = bool(use_save_on_cpu and int(clipid_target_i or -1) == 3)
-                                except Exception:
-                                    pass
-                                save_ctx = nullcontext()
-                                if use_save_on_cpu:
-                                    try:
-                                        save_ctx = torch.autograd.graph.save_on_cpu(pin_memory=pin_save_on_cpu)
-                                    except Exception:
-                                        save_ctx = nullcontext()
-                                with save_ctx:
-                                    with torch.amp.autocast("cuda", dtype=model_dtype):
-                                        lp = gpt_replay.ar_infer_infinity_elegant_replay_logprob(
-                                            vae=self.vae_local,
-                                            scale_schedule=scale_schedule,
-                                            label_B_or_BLT=label_i,
-                                            B=1,
-                                            negative_label_B_or_BLT=None,
-                                            g_seed=None,
-                                            cfg_list=cfg_list,
-                                            tau_list=[float(x) for x in tau_list],
-                                            top_k=top_k,
-                                            top_p=top_p,
-                                            trunk_scale=1000,
-                                            gt_leak=gt_leak,
-                                            gt_ls_Bl=gt_ls_gpu,
-                                            low_vram_mode=False,
-                                            args=infer_args,
-                                            get_visual_rope_embeds=self.get_visual_rope_embeds,
-                                            context_info=context_info,
-                                            forced_idx_trace=idx_trace,
-                                            logprob_clipid_target=clipid_target_i,
-                                            kv_cache_reset=True,
-                                            skip_text_forward=False,
-                                            cache_text_as_gt=False,
-                                        )
-                                newlp_t[si] = lp[0]
-                            else:
-                                # trace_ce: teacher-forcing evaluation in a single forward pass (no KV-cache replay).
-                                # This is the standard PPO/RLHF approach for computing logp_new on chosen tokens.
-                                import math as _math
-                                import json as _json
-                                import torch.nn.functional as _F
-                                from infinity.schedules.dynamic_resolution import get_first_full_spatial_size_scale_index as _ffssi
-                                from infinity.schedules.infinity_elegant import interpolate as _interp
-
-                                gpt_eval = getattr(self, "gpt", None)
-                                if gpt_eval is None:
-                                    raise RuntimeError("trace_ce requires self.gpt (FSDP/DDP) to run a forward pass")
-
-                                # Build repeat-aware mapping from each scale -> last-repeat trace index (cache step id).
-                                # Prefer repetition recorded in StageA trace to guarantee strict alignment.
-                                try:
-                                    img_rep_s = str(tr.get("image_scale_repetition", getattr(infer_args, "image_scale_repetition", "[1]"))).strip()
-                                    vid_rep_s = str(tr.get("video_scale_repetition", getattr(infer_args, "video_scale_repetition", "[1]"))).strip()
-                                    image_rep = np.array(_json.loads(img_rep_s))
-                                    video_rep = np.array(_json.loads(vid_rep_s))
-                                except Exception as e:
-                                    raise RuntimeError(f"trace_ce requires valid image/video_scale_repetition: {e}")
-                                first_full = _ffssi(scale_schedule)
-                                scales_in_one_clip = int(first_full) + 1
-                                max_repeat_times = int(getattr(infer_args, "max_repeat_times", 999999))
-
-                                rep_counts: List[int] = []
-                                cache_step_id: Dict[int, int] = {}
-                                step_ptr0 = 0
-                                for _si, _pn in enumerate(scale_schedule):
-                                    if _si < scales_in_one_clip:
-                                        _rt = int(image_rep[_si % scales_in_one_clip])
-                                    else:
-                                        _rt = int(video_rep[_si % scales_in_one_clip])
-                                    _rt = int(min(_rt, max_repeat_times))
-                                    _rt = max(1, _rt)
-                                    rep_counts.append(_rt)
-                                    cache_step_id[int(_si)] = int(step_ptr0 + _rt - 1)
-                                    step_ptr0 += _rt
-                                total_steps = int(step_ptr0)
-                                if not (isinstance(idx_trace, list) and len(idx_trace) >= total_steps):
-                                    raise RuntimeError(
-                                        f"trace_ce expects idx_trace list length >= total_steps ({len(idx_trace) if isinstance(idx_trace, list) else 'NA'} < {total_steps})"
-                                    )
-
-                                # Prepare VAE-scale schedule.
-                                apply_patchify = bool(getattr(gpt_replay, "apply_spatial_patchify", False))
-                                if apply_patchify:
-                                    vae_scale_schedule = [(int(pt), int(2 * ph), int(2 * pw)) for (pt, ph, pw) in scale_schedule]
-                                else:
-                                    vae_scale_schedule = [(int(pt), int(ph), int(pw)) for (pt, ph, pw) in scale_schedule]
-
-                                # Helper: latent [B, d, t, h, w] -> raw visual tokens [B, t*h*w, d] (or patchified).
-                                def _latent_to_raw_tokens(lat: torch.Tensor) -> torch.Tensor:
-                                    if apply_patchify:
-                                        _x = lat.permute(0, 2, 1, 3, 4)  # [B, t, d, 2h, 2w]
-                                        _x = torch.nn.functional.pixel_unshuffle(_x, 2)  # [B, t, 4d, h, w]
-                                        _x = _x.permute(0, 2, 1, 3, 4)  # [B, 4d, t, h, w]
-                                    else:
-                                        _x = lat
-                                    _x = _x.reshape(_x.shape[0], _x.shape[1], -1).permute(0, 2, 1).contiguous()
-                                    return _x
-
-                                # Build per-scale inputs/labels/rope from the cached (last-repeat) trace token,
-                                # and update latent state from idx_trace (no transformer).
-                                B1 = 1
-                                # Use model dtype for latent math; forward will cast x_BLC to fp32 anyway.
-                                lat_dtype = model_dtype
-                                device0 = loss.device
-                                vae_embed_dim = int(
-                                    getattr(gpt_replay, "vae_embed_dim", 0)
-                                    or getattr(self.vae_local, "embed_dim", 0)
-                                    or getattr(self.vae_local, "vae_embed_dim", 0)
-                                    or 64
-                                )
-                                if getattr(gpt_replay.other_args, "noise_input", 0):
-                                    noise0 = torch.randn((1, vae_embed_dim, *vae_scale_schedule[0]), device=device0, dtype=lat_dtype)
-                                else:
-                                    noise0 = torch.zeros((1, vae_embed_dim, *vae_scale_schedule[0]), device=device0, dtype=lat_dtype)
-                                summed_code = noise0[0:1]
-                                # Deterministic scale selection:
-                                # Prefer StageA-provided selection list to guarantee strict old/new logprob alignment.
-                                select_si_list = None
-                                try:
-                                    sel = tr.get("trace_ce_select_si_list", None)
-                                    if isinstance(sel, list) and len(sel) > 0:
-                                        select_si_list = [int(x) for x in sel]
-                                except Exception:
-                                    select_si_list = None
-                                if select_si_list is None:
-                                    select_si_list = list(range(len(scale_schedule)))
-                                try:
-                                    total_tokens = int(np.array(scale_schedule).prod(-1).sum())
-                                    tmax = int(tr.get("trace_ce_tmax", getattr(args, "train_max_token_len", 20480) or 20480) or 20480)
-                                    if total_tokens > tmax and len(select_si_list) == len(scale_schedule):
-                                        S = int(scales_in_one_clip)
-                                        L = int(len(scale_schedule))
-                                        c = int(clipid_target_i) if clipid_target_i is not None else 1
-                                        if L == S * 4:
-                                            if c <= 1:
-                                                select_si_list = list(range(min(L, S + 11)))
-                                            elif c == 2:
-                                                select_si_list = [S - 1, 2 * S - 1] + list(range(2 * S, min(L, 2 * S + 11)))
-                                            else:
-                                                select_si_list = [S - 1, 2 * S - 1, 3 * S - 1] + list(range(3 * S, min(L, 3 * S + 11)))
-                                        elif L == S * 3:
-                                            if c <= 1:
-                                                select_si_list = list(range(min(L, S + 11)))
-                                            else:
-                                                select_si_list = [S - 1, 2 * S - 1] + list(range(2 * S, min(L, 2 * S + 11)))
-                                        else:
-                                            # Generic fallback: keep all first clip + one high-res scale from target clip if possible.
-                                            select_si_list = list(range(min(L, S)))
-                                            tgt = min(L - 1, c * S + (S - 1))
-                                            if tgt not in select_si_list:
-                                                select_si_list.append(tgt)
-                                        # Ensure unique & in-range.
-                                        select_si_list = sorted({int(x) for x in select_si_list if 0 <= int(x) < L})
-                                except Exception:
-                                    select_si_list = list(range(len(scale_schedule)))
-
-                                # Remap context_info ref_sids to selected subset (drop missing refs).
-                                real_si_2_new_si: Dict[int, int] = {int(r): int(i2) for i2, r in enumerate(select_si_list)}
-                                new_scale_pack_info: Dict[int, Dict[str, Any]] = {}
-                                for new_q, real_q in enumerate(select_si_list):
-                                    new_scale_pack_info[int(new_q)] = {"ref_sids": []}
-                                    try:
-                                        refs = context_info[int(real_q)].get("ref_sids", [])
-                                    except Exception:
-                                        refs = []
-                                    for rr in refs:
-                                        nn = real_si_2_new_si.get(int(rr), None)
-                                        if nn is not None:
-                                            new_scale_pack_info[int(new_q)]["ref_sids"].append(int(nn))
-
-                                # Build x_BLC/gt_BL/visual_rope_cache for selected scales (teacher forcing).
-                                x_scales = []
-                                gt_scales = []
-                                rope_scales = []
-                                dlabels = []
-                                muls = []
-                                clipids = []
-                                for _si, _pn in enumerate(scale_schedule):
-                                    pt, ph, pw = int(_pn[0]), int(_pn[1]), int(_pn[2])
-                                    # compute current scale input (downsampled summed_code)
-                                    this_lat = summed_code
-                                    if tuple(this_lat.shape[-3:]) != tuple(vae_scale_schedule[_si]):
-                                        this_lat = _F.interpolate(this_lat, size=vae_scale_schedule[_si], mode=self.vae_local.quantizer.z_interplote_down).contiguous()
-                                    if int(_si) in real_si_2_new_si:
-                                        x_scales.append(_latent_to_raw_tokens(this_lat))
-                                        # rope cache uses cached-step real_si (last repeat)
-                                        rope_scales.append(
-                                            self.get_visual_rope_embeds(
-                                                gpt_replay.rope2d_freqs_grid,
-                                                scale_schedule,
-                                                int(_si),
-                                                int(cache_step_id[int(_si)]),
-                                                device0,
-                                                infer_args,
-                                                context_info,
-                                                int(first_full),
-                                            )
-                                        )
-                                        mul = int(pt * ph * pw)
-                                        muls.append(mul)
-                                        d_label = int(
-                                            getattr(gpt_replay.other_args, "detail_scale_dim", 64)
-                                            if (ph * pw) >= int(getattr(self.vae_local.quantizer, "detail_scale_min_tokens", 350))
-                                            else getattr(gpt_replay.other_args, "semantic_scale_dim", 16)
-                                        )
-                                        dlabels.append(d_label)
-                                        clipids.append(int(_si // max(1, scales_in_one_clip)))
-                                        forced = idx_trace[int(cache_step_id[int(_si)])]
-                                        if not isinstance(forced, torch.Tensor):
-                                            forced = torch.tensor(forced, dtype=torch.long, device=device0)
-                                        else:
-                                            forced = forced.to(device=device0, dtype=torch.long)
-                                        if forced.ndim == 1:
-                                            forced = forced.unsqueeze(0)
-                                        gt_scales.append(forced.reshape(B1, mul, d_label).contiguous())
-
-                                    # Update latent state from cached token at this scale (keeps conditioning consistent).
-                                    # Target spatial size for codes accumulation.
-                                    if _si < scales_in_one_clip:
-                                        target_pn = vae_scale_schedule[int(first_full)]
-                                    else:
-                                        target_pn = vae_scale_schedule[-1]
-                                    forced_upd = idx_trace[int(cache_step_id[int(_si)])]
-                                    if not isinstance(forced_upd, torch.Tensor):
-                                        forced_upd = torch.tensor(forced_upd, dtype=torch.long, device=device0)
-                                    else:
-                                        forced_upd = forced_upd.to(device=device0, dtype=torch.long)
-                                    if forced_upd.ndim == 1:
-                                        forced_upd = forced_upd.unsqueeze(0)
-                                    mul = int(pt * ph * pw)
-                                    d_label = int(
-                                        getattr(gpt_replay.other_args, "detail_scale_dim", 64)
-                                        if (ph * pw) >= int(getattr(self.vae_local.quantizer, "detail_scale_min_tokens", 350))
-                                        else getattr(gpt_replay.other_args, "semantic_scale_dim", 16)
-                                    )
-                                    idx_Bld = forced_upd.reshape(B1, -1)
-                                    idx_Bthwd = idx_Bld.reshape(B1, pt, ph, pw, d_label)
-                                    if apply_patchify:
-                                        _t = idx_Bthwd.permute(0, 1, 4, 2, 3)
-                                        _t = torch.nn.functional.pixel_shuffle(_t, 2)
-                                        idx_Bthwd = _t.permute(0, 1, 3, 4, 2)
-                                    if gt_leak > 0 and gt_ls_Bl is not None and int(_si) < int(gt_leak):
-                                        try:
-                                            idx_Bthwd = gt_ls_Bl[int(cache_step_id[int(_si)])].to(device=device0, dtype=idx_Bthwd.dtype)
-                                        except Exception:
-                                            pass
-                                    if getattr(gpt_replay.other_args, "use_two_stage_lfq", 0):
-                                        if (ph * pw) >= int(getattr(self.vae_local.quantizer, "detail_scale_min_tokens", 350)):
-                                            is_sem = False
-                                            lfq = self.vae_local.quantizer.lfq_detail
-                                        else:
-                                            is_sem = True
-                                            lfq = self.vae_local.quantizer.lfq_semantic
-                                        codes = lfq.indices_to_codes(idx_Bthwd, "bit_label")
-                                        codes = _interp(
-                                            codes,
-                                            size=(vae_embed_dim, *target_pn),
-                                            mode=self.vae_local.quantizer.z_interplote_up,
-                                            quantizer=self.vae_local.quantizer,
-                                            is_semantic_scale=is_sem,
-                                        ).contiguous()
-                                    else:
-                                        codes = self.vae_local.quantizer.lfq_detail.indices_to_codes(idx_Bthwd, "bit_label")
-                                        codes = _F.interpolate(codes, size=target_pn, mode=self.vae_local.quantizer.z_interplote_up)
-                                    summed_code = _F.interpolate(summed_code, size=target_pn, mode=self.vae_local.quantizer.z_interplote_up).contiguous()
-                                    summed_code = summed_code + codes
-                                    # advance to next scale input (downsample if needed) is handled at loop head
-
-                                    if _si < len(scale_schedule) - 1:
-                                        if tuple(scale_schedule[int(_si)][-2:]) == tuple(scale_schedule[-1][-2:]):
-                                            if getattr(gpt_replay.other_args, "noise_input", 0):
-                                                summed_code = torch.randn((B1, summed_code.shape[1], *vae_scale_schedule[int(_si) + 1]), device=device0, dtype=summed_code.dtype)
-                                            else:
-                                                summed_code = torch.zeros((B1, summed_code.shape[1], *vae_scale_schedule[int(_si) + 1]), device=device0, dtype=summed_code.dtype)
-
-                                x_vis = torch.cat(x_scales, dim=1) if len(x_scales) else torch.zeros((B1, 1, vae_embed_dim), device=device0, dtype=lat_dtype)
-                                rope_vis = torch.cat(rope_scales, dim=4) if len(rope_scales) else self.get_visual_rope_embeds(
-                                    gpt_replay.rope2d_freqs_grid,
-                                    scale_schedule,
-                                    0,
-                                    0,
-                                    device0,
-                                    infer_args,
-                                    context_info,
-                                    int(first_full),
-                                )
-
-                                # Build super_scale_lengths and querysid_refsid (same logic as `video_encode`).
-                                kv_i, lens_i, cu_i, le = label_i
-                                text_lens = list(lens_i)
-                                scale_lengths = [int(np.array(scale_schedule[si]).prod()) for si in select_si_list] + [int(x) for x in text_lens]
-                                valid_scales = int(len(select_si_list) + len(text_lens))
-                                # Match Infinity.forward padding regime: after concatenating (visual + text),
-                                # the model pads to pad_to_multiplier when train_with_var_seq_len=1.
-                                # build_flex_attn_func asserts sum(super_scale_lengths) == padded_seq_len.
-                                cur_seq_len = int(np.sum(scale_lengths))
-                                try:
-                                    if int(getattr(args, "train_with_var_seq_len", 0) or 0) == 1:
-                                        pad_to = int(getattr(args, "pad_to_multiplier", 128) or 128)
-                                        pad_to = max(1, pad_to)
-                                        pad_seq_len = int(_math.ceil(cur_seq_len / float(pad_to)) * pad_to - cur_seq_len)
-                                    else:
-                                        pad_seq_len = int(getattr(args, "train_max_token_len", -1) or -1) - cur_seq_len
-                                    pad_seq_len = int(max(0, pad_seq_len))
-                                    if pad_seq_len > 0:
-                                        scale_lengths = scale_lengths + [int(pad_seq_len)]
-                                except Exception:
-                                    pass
-                                max_sid_nums = 2000
-                                qref = torch.zeros((max_sid_nums, max_sid_nums), device=device0, dtype=torch.bool)
-                                for i_sid in range(valid_scales):
-                                    qref[i_sid][i_sid] = True
-                                base = 0
-                                # Only one packed sample (B=1): ind=0, global_text_sid = len(flatten_packing_scales)+0.
-                                for local_q in range(len(select_si_list)):
-                                    global_q = local_q + base
-                                    global_text_sid = len(select_si_list) + 0
-                                    qref[global_q][global_text_sid] = True
-                                    for local_r in new_scale_pack_info[int(local_q)]["ref_sids"]:
-                                        qref[global_q][base + int(local_r)] = True
-
-                                # Disable condition-drop randomness during policy scoring (keep deterministic ratio).
-                                orig_cdr = float(getattr(gpt_replay, "cond_drop_rate", 0.0) or 0.0)
-                                try:
-                                    gpt_replay.cond_drop_rate = 0.0
-                                except Exception:
-                                    pass
-                                try:
-                                    # Keep model in training mode so checkpointing (`full-block`) stays enabled.
-                                    with torch.amp.autocast("cuda", dtype=model_dtype):
-                                        loss_tok, _, _ = gpt_eval(
-                                            label_i,
-                                            x_vis,
-                                            gt_BL=gt_scales,
-                                            is_image_batch=0,
-                                            visual_rope_cache=rope_vis,
-                                            sequece_packing_scales=[[tuple(map(int, scale_schedule[si])) for si in select_si_list]],
-                                            super_scale_lengths=scale_lengths,
-                                            super_querysid_super_refsid=qref,
-                                            other_info_by_scale=None,
-                                        )
-                                finally:
-                                    try:
-                                        gpt_replay.cond_drop_rate = orig_cdr
-                                    except Exception:
-                                        pass
-
-                                # Convert mean-over-d token loss -> logprob, and select only target clip.
-                                nll_target = torch.zeros((1,), dtype=loss.dtype, device=device0)
-                                # Token counts:
-                                # - tok_cnt_elems: number of bit-elements (mul*d_label) matching summed logprob units,
-                                #                 used for selected-token KL normalization.
-                                tok_cnt_elems = 0
-                                tok_ptr = 0
-                                for j, si_real in enumerate(select_si_list):
-                                    mul = int(muls[j])
-                                    seg = loss_tok[tok_ptr : tok_ptr + mul]
-                                    tok_ptr += mul
-                                    dlab = float(dlabels[j])
-                                    if clipid_target_i is not None and int(clipids[j]) != int(clipid_target_i):
-                                        continue
-                                    nll_target = nll_target + seg.sum() * dlab
-                                    tok_cnt_elems += int(mul) * int(dlabels[j])
-                                newlp_t[si] = (-nll_target)[0]
-                                # Optional auxiliary stabilizer: mean teacher-forcing CE on target-clip tokens.
-                                # This is a cheap "quality/anti-collapse" constraint and does NOT require a full packed backward.
-                                if aux_sft_by_sample is not None:
-                                    # `nll_target` is summed over (mul*d_label) elements; normalize by element count.
-                                    aux_sft_by_sample[si] = (nll_target / float(max(1, tok_cnt_elems)))[0]
-                                # Override tok_t using deterministic counts from trace_ce packing.
-                                # This avoids KL normalization spikes when idx_trace/step_clipids counting fails.
-                                try:
-                                    if int(tok_cnt_elems) > 0:
-                                        tok_t[si] = float(tok_cnt_elems)
-                                except Exception:
-                                    pass
-
-                    # PPO-style clipped objective per sample (must handle +/- advantage correctly).
-                    # Standard PPO:
-                    #   obj = min(ratio*A, clip(ratio)*A) when A>=0
-                    #   obj = max(ratio*A, clip(ratio)*A) when A<0
-                    # Compute ratio in fp32 to avoid fp16/bf16 exp overflow (inf) and 0*inf -> nan.
-                    delta = (newlp_t - oldlp_t).to(torch.float32).clamp(min=-60.0, max=60.0)
-                    ratio = torch.exp(delta)
-                    eps = float(getattr(args, "grpo_ratio_eps", 0.2))
-                    ratio_clip = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
-                    wt32 = weight_t.to(torch.float32)
-                    unclipped = ratio * wt32
-                    clipped = ratio_clip * wt32
-                    obj = torch.where(wt32 >= 0, torch.minimum(unclipped, clipped), torch.maximum(unclipped, clipped))
-                    pg_by_sample = (-obj).to(loss.dtype)
-                    beta = float(getattr(args, "grpo_kl_beta", 0.0) or 0.0)
-                    # selected-token KL approximation (cheap): E[logpi_new - logpi_ref] over selected tokens
-                    if beta > 0:
-                        if isinstance(grpo_ref_logprobs, list) and len(grpo_ref_logprobs) == n_s:
-                            ref_t = torch.tensor([float(x) for x in grpo_ref_logprobs], dtype=loss.dtype, device=loss.device)
-                        else:
-                            # fallback: treat old policy as ref (valid when rollout ckpt == ref ckpt)
-                            ref_t = oldlp_t
-                        ref_t = torch.nan_to_num(ref_t, nan=0.0, posinf=0.0, neginf=0.0)
-                        tok_safe = torch.nan_to_num(tok_t, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0)
-                        kl_per_token = (newlp_t - ref_t) / tok_safe
-                        kl_per_token = torch.nan_to_num(kl_per_token, nan=0.0, posinf=0.0, neginf=0.0)
-                        approx_kl = kl_per_token.mean()
-                        metric_lg.update(approx_kl=approx_kl)
-                        # IMPORTANT: this is an *approximation* computed on offline sampled tokens, so it can be
-                        # slightly negative due to sampling noise / mismatch. A negative "KL penalty" would
-                        # incorrectly *reward* divergence. We clamp the penalty to be non-negative.
-                        kl_pen = kl_per_token.clamp_min(0.0)
-                        pg_by_sample = pg_by_sample + beta * kl_pen
-                    # Add auxiliary stabilizer loss per sample (trace_ce only).
-                    # NOTE: This is intentionally added inside the strict PPO loss so it remains memory-efficient.
-                    if aux_sft_by_sample is not None and float(aux) > 0:
-                        pg_by_sample = pg_by_sample + float(aux) * aux_sft_by_sample.to(pg_by_sample.dtype)
+            # Exact GRPO returns through _train_sampling_trace before this SFT path.
             for sample_ind, item in enumerate(sequece_packing_scales):
                 full_pt = full_pts_this_batch[sample_ind]
                 for si, (pt, ph, pw) in enumerate(item):
@@ -1416,10 +851,10 @@ class InfinityTrainer(object):
                     if use_grpo and weight_t is not None:
                         adv = weight_t[sample_ind]
                         if pg_by_sample is not None:
-                            # Trace-replay PPO objective (per-sample), broadcast to all scales for weighting.
+                            # Historical per-sample objective; inactive for released exact GRPO.
                             pg_obj = pg_by_sample[sample_ind]
                         elif oldlp_t is not None:
-                            # Legacy proxy: per-scale negative CE as logp_new estimate (kept for compatibility).
+                            # Historical CE proxy; not a supported exact-GRPO fallback.
                             logp_new = -loss_this_scale
                             delta = (logp_new - oldlp_t[sample_ind]).to(torch.float32).clamp(min=-60.0, max=60.0)
                             ratio = torch.exp(delta)
@@ -1428,13 +863,13 @@ class InfinityTrainer(object):
                             adv32 = adv.to(torch.float32) if isinstance(adv, torch.Tensor) else torch.tensor(float(adv), device=loss.device, dtype=torch.float32)
                             unclipped = ratio * adv32
                             clipped = ratio_clip * adv32
-                            obj = torch.minimum(unclipped, clipped) if float(adv32.item()) >= 0 else torch.maximum(unclipped, clipped)
+                            obj = torch.minimum(unclipped, clipped)
                             pg_obj = (-obj).to(loss.dtype)
                             if float(getattr(args, "grpo_kl_beta", 0.0)) > 0:
                                 kl_proxy = (logp_new - oldlp_t[sample_ind]) ** 2
                                 pg_obj = pg_obj + float(getattr(args, "grpo_kl_beta", 0.0)) * kl_proxy
                         else:
-                            # Fallback: reward-weighted policy-gradient proxy without ratio clipping.
+                            # Historical reward-weighted proxy; exact GRPO cannot reach this branch.
                             pg_obj = adv * loss_this_scale
                         if pg_obj is not None:
                             flatten_pg_obj_list.append(pg_obj)
@@ -1445,15 +880,15 @@ class InfinityTrainer(object):
             flatten_weight_list = flatten_weight_list / flatten_weight_list.sum()
             sft_loss = (torch.stack(flatten_L_list) * flatten_weight_list).sum()
             if use_grpo and len(flatten_pg_obj_list) == len(flatten_L_list) and len(flatten_pg_obj_list) > 0:
-                # Non-strict fallback path (e.g. no old_logprob): keep legacy behavior.
+                # Historical packed objective; current exact GRPO returns before this branch.
                 rl_loss = (torch.stack(flatten_pg_obj_list) * flatten_weight_list).sum()
-                # Optional hybrid scaling: shrink GRPO update magnitude when mixing with a stronger SFT anchor.
+                # Historical packed-branch scaling; exact replay applies its coefficient separately.
                 rl_coef = float(getattr(args, "grpo_hybrid_rl_coef", 1.0) or 1.0)
                 if rl_coef != 1.0:
                     rl_loss = rl_loss * rl_coef
                 aux = float(getattr(args, "grpo_aux_sft_coef", 0.0) or 0.0)
-                # If strict PPO objective is present (pg_by_sample != None), auxiliary is already included there
-                # (for trace_ce) and we must NOT force a full packed backward via sft_loss.
+                # Historical auxiliary handling; exact replay rejects nonzero auxiliary
+                # SFT coefficients and does not execute this packed-loss branch.
                 if pg_by_sample is not None:
                     final_loss = rl_loss
                 else:

@@ -193,29 +193,20 @@ if [ ! -d "${UAVFLOW_TASK_JSON_ROOT}" ]; then
   exit 1
 fi
 
-# StageB(trace_ce) compatibility:
-# Use teacher-forcing single-forward logprob to populate old_logprob in StageA outputs.
-INFINITY_STAGEA_OLD_LOGPROB_MODE="${INFINITY_STAGEA_OLD_LOGPROB_MODE:-trace_ce}"   # trace_ce | sampling
-INFINITY_GRPO_TRACE_CE_TMAX="${INFINITY_GRPO_TRACE_CE_TMAX:-20480}"
-export INFINITY_STAGEA_OLD_LOGPROB_MODE INFINITY_GRPO_TRACE_CE_TMAX
-#
-# IMPORTANT:
-# If trace_ce old_logprob fails and we silently fall back to sampling logprob, StageB ratio/KL becomes inconsistent
-# and can easily collapse the video quality (checkerboard/garbled frames). Therefore we default to strict mode:
-# make StageA treat trace_ce failure as a rollout failure (so the retry loop kicks in).
-INFINITY_STAGEA_OLD_LOGPROB_STRICT="${INFINITY_STAGEA_OLD_LOGPROB_STRICT:-1}"
-export INFINITY_STAGEA_OLD_LOGPROB_STRICT
-
-# When using trace_ce logprob, strongly recommend cfg=1 and tau=1 to keep the behavior policy
-# consistent with the teacher-forcing scoring distribution.
-if [ "${INFINITY_STAGEA_OLD_LOGPROB_MODE}" = "trace_ce" ]; then
-  export INFINITY_CFG="${INFINITY_CFG:-1.0}"
-  export INFINITY_TAU_IMAGE="${INFINITY_TAU_IMAGE:-1.0}"
-  export INFINITY_TAU_VIDEO="${INFINITY_TAU_VIDEO:-1.0}"
-  # For strict on-policy consistency, sample from the full distribution (no top-k/top-p truncation).
-  export INFINITY_TOP_K="${INFINITY_TOP_K:-0}"
-  export INFINITY_TOP_P="${INFINITY_TOP_P:-1.0}"
+# Strict behavior-policy likelihood. Sampling and replay share the same AR loop.
+INFINITY_STAGEA_OLD_LOGPROB_MODE="${INFINITY_STAGEA_OLD_LOGPROB_MODE:-sampling}"
+if [ "${INFINITY_STAGEA_OLD_LOGPROB_MODE}" != "sampling" ]; then
+  echo "[stageA][fatal] strict GRPO supports sampling old logprob only."
+  exit 1
 fi
+export INFINITY_STAGEA_OLD_LOGPROB_MODE
+export INFINITY_STAGEA_OLD_LOGPROB_STRICT=1
+export INFINITY_CFG="${INFINITY_CFG:-1.0}"
+export INFINITY_TAU_IMAGE="${INFINITY_TAU_IMAGE:-1.0}"
+export INFINITY_TAU_VIDEO="${INFINITY_TAU_VIDEO:-1.0}"
+export INFINITY_TOP_K="${INFINITY_TOP_K:-0}"
+export INFINITY_TOP_P="${INFINITY_TOP_P:-1.0}"
+INFINITY_GRPO_TRACE_CE_TMAX="${INFINITY_GRPO_TRACE_CE_TMAX:-20480}"
 
 grpo_resolve_cluster_env
 if [ "${STAGEA_NPROC_ENV_SET}" -eq 0 ]; then
@@ -226,6 +217,10 @@ if [ -z "${STAGEA_GPU_IDS}" ]; then
 fi
 if [ "${N_SHARDS_ENV_SET}" -eq 0 ]; then
   N_SHARDS="$((STAGEA_NPROC * NNODES))"
+fi
+if [ "${STAGEA_NPROC}" -ne 1 ] || [ "${NNODES}" -ne 1 ]; then
+  echo "[stageA][fatal] one remote_sim service requires STAGEA_NPROC=1 and NNODES=1; use independent simulator services for parallel rollout."
+  exit 1
 fi
 if [ "${STAGEA_NPROC}" -le 0 ]; then
   echo "[stageA][fatal] STAGEA_NPROC must be positive, got ${STAGEA_NPROC}"

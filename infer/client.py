@@ -1133,7 +1133,7 @@ def main():
     ap.add_argument("--body_apply_order", type=str, default="yaw_first", choices=["yaw_first", "trans_first", "midpoint"], help="Only for --action_frame=body. yaw_first: yaw+=dyaw then translate; trans_first: translate with old yaw then yaw+=dyaw; midpoint: translate with yaw+0.5*dyaw then yaw+=dyaw.")
     ap.add_argument("--max_actions", type=int, default=48, help="(mode=unrealcv) If >0, stop after executing this many actions (each action -> 1 captured frame). Default 48 (i.e. 1+48=49 frames total). Set 0 to use --num_frames bound instead.")
     ap.add_argument("--server_url", type=str, default="http://127.0.0.1:8002", help="Server base URL (no trailing endpoint).")
-    ap.add_argument("--out_dir", type=str, default=r"E:\xjc\UAV-Flow-main1\UAV-Flow-main\UAV-Flow-Eval\cache", help="Where to write per-session json outputs.")
+    ap.add_argument("--out_dir", type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "outputs", "infer_cache")), help="Where to write per-session json outputs.")
     ap.add_argument("--route_id", type=str, default="", help="If set, only run this route id (folder name).")
     ap.add_argument("--max_routes", type=int, default=0, help="If >0, limit number of routes processed.")
     ap.add_argument("--select_n", type=int, default=0, help="If >0, pick first N routes after filtering (deterministic).")

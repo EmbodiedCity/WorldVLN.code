@@ -114,7 +114,7 @@ def _make_args(
     tau_image: float,
     tau_video: float,
 ) -> SimpleNamespace:
-    ckpt_dir = osp.join(REPO_ROOT, "checkpoint")
+    ckpt_dir = osp.abspath(os.environ.get("CHECKPOINTS_DIR", osp.join(REPO_ROOT, "checkpoint")))
     ckpt_layout = _resolve_checkpoint_layout(ckpt)
     # Prefer the repo's Args (has a complete set of defaults) to avoid missing-field crashes.
     # Fallback to SimpleNamespace if Tap/Args is unavailable in current python env.
@@ -131,8 +131,8 @@ def _make_args(
     a.temporal_compress_rate = 4
     a.videovae = 10
     a.vae_type = 64
-    a.vae_path = osp.join(ckpt_dir, "infinitystar_videovae.pth")
-    a.text_encoder_ckpt = osp.join(ckpt_dir, "text_encoder", "flan-t5-xl-official")
+    a.vae_path = osp.abspath(os.environ.get("VAE_PATH", osp.join(ckpt_dir, "infinitystar_videovae.pth")))
+    a.text_encoder_ckpt = osp.abspath(os.environ.get("T5_PATH", osp.join(ckpt_dir, "text_encoder", "flan-t5-xl-official")))
     a.text_channels = 2048
     # Keep aliases used across repo scripts.
     a.Ct5 = a.text_channels
@@ -150,7 +150,12 @@ def _make_args(
 
     # inference knobs (match tools/infer_video_480p.py & our finetune inference script)
     a.use_flex_attn = True
-    a.bf16 = 1
+    block_dtype = os.environ.get("INFINITY_BLOCK_DTYPE", "float32").strip().lower()
+    if block_dtype not in {"float32", "bfloat16"}:
+        raise ValueError("INFINITY_BLOCK_DTYPE must be float32 or bfloat16")
+    # Keep FP32 master weights by default for subsequent policy optimization.
+    # BF16 storage is supported for a frozen-backbone/heads-only policy update.
+    a.bf16 = int(block_dtype == "bfloat16")
     a.use_apg = 1
     a.use_cfg = 0
     a.cfg = float(cfg)

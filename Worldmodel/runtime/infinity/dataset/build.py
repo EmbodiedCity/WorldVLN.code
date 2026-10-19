@@ -80,7 +80,7 @@ class RandomResize:
         return f'RandomResize(reso=({self.reso_lb}, {self.reso_ub}), interpolation={self.interpolation})'
 
 
-def load_save(reso=512):
+def load_save(src_folder, reso=512):
     import os
     from PIL import Image as PImage
     from torchvision.transforms import transforms, InterpolationMode
@@ -88,7 +88,6 @@ def load_save(reso=512):
         transforms.Resize(512, interpolation=InterpolationMode.LANCZOS),
         transforms.CenterCrop((512, 512))
     ])
-    src_folder = r'C:\Users\16333\Pictures\imgs_to_visual_v2'
     ls = [os.path.join(src_folder, x) for x in ('1.jpg', '2.jpg', '3.png', '4.png', '5.png')]
     print(ls)
     imgs = []
