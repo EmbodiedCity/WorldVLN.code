@@ -11,9 +11,6 @@ The simulator-side service is implemented by runtime/client.py in service mode. 
 - POST /step_actions
 - POST /abort (matching session only)
 
-For exact policy replay, checkpoint precision and a small training update,
-see [Online RL guide](./online_rl.md).
-
 ## Start the Service
 
 On the simulator machine:

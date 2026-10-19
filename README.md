@@ -200,19 +200,17 @@ bash train/action_decoder/scripts/train_stageB_ddp.sh
 
 ### Stage 2: Action-aware GRPO
 
-For the exact sampled-token replay path, Windows simulator service, precision
-settings, and a three-update heads-only smoke run, see
-[Online RL guide](./action_aware_grpo/docs/online_rl.md).
 Stage A loads the policy inside its rollout worker; a separate HTTP model
 server is only needed by independent inference clients.
 
 #### Quick start (rollout + train)
 
-Start the simulator service on the simulator host and verify that its `/health`
-endpoint is reachable from the training host. See the
-[Online RL guide](./action_aware_grpo/docs/online_rl.md#windows-simulator-service)
-for the Windows launcher and reverse tunnel. Stage A loads the policy in its
-own worker, so the rollout workflow does not require a separate HTTP model service.
+Start the simulator service on the simulator host using
+`action_aware_grpo/scripts/run_simulator_service.ps1` on Windows, and verify
+that its `/health` endpoint is reachable from the training host. For reverse
+port forwarding, see [Remote Simulator Workflow](./action_aware_grpo/docs/remote_sim.md).
+Stage A loads the policy in its own worker, so rollout collection does not
+require a separate HTTP model service.
 
 Run rollout collection:
 
@@ -246,7 +244,7 @@ REPLAY_META_DIR=/path/to/replay_meta_rollout_smoke \
 bash action_aware_grpo/scripts/run_stageb_full.sh RUN_ID=stageb_full
 ```
 
-This entry point selects `FREEZE_CHUNK_PREFIX=0` and `GRPO_BLOCK_DTYPE=float32` for optimizer master weights; conflicting inherited settings fail explicitly. With the default `GRPO_FSDP_COMPUTE_DTYPE=none`, collect fresh traces with the default FP32 Stage A policy before training. Optional `GRPO_FSDP_COMPUTE_DTYPE=bfloat16` keeps FP32 masters and uses BF16 transformer forwards, requiring fresh matching BF16 Stage A traces; see the guide for its FSDP requirements. BF16 heads-only smoke traces cannot be reused for the default FP32 forward configuration. Configure asset/data locations and GPU resources for your machine; the BF16-compute/FP32-CPU-master path has now passed an online full-backbone smoke test: two 49-frame trajectories, six clip rewards and one accumulated update using the first clip of each trajectory, with all 36 backbone layers verified changed in the checkpoint. See [the online RL guide](./action_aware_grpo/docs/online_rl.md) for details and the separate partial-freeze entry point.
+This entry point selects `FREEZE_CHUNK_PREFIX=0` and `GRPO_BLOCK_DTYPE=float32` for optimizer master weights; conflicting inherited settings fail explicitly. With the default `GRPO_FSDP_COMPUTE_DTYPE=none`, collect fresh traces with the default FP32 Stage A policy before training. Optional `GRPO_FSDP_COMPUTE_DTYPE=bfloat16` keeps FP32 masters and uses BF16 transformer forwards, requiring fresh matching BF16 Stage A traces, with FSDP enabled (`ZERO_STAGE>0`) and BF16 AMP (`fp16=2`). BF16 heads-only smoke traces cannot be reused for the default FP32 forward configuration. Configure asset/data locations and GPU resources for your machine; the BF16-compute/FP32-CPU-master path has now passed an online full-backbone smoke test: two 49-frame trajectories, six clip rewards and one accumulated update using the first clip of each trajectory, with all 36 backbone layers verified changed in the checkpoint. Use `action_aware_grpo/scripts/run_stageb_partialfreeze.sh` for partial-freeze training.
 
 #### Optional standalone inference service
 
